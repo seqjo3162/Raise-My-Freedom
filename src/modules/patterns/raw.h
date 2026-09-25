@@ -19,7 +19,7 @@ typedef enum {
 struct raw_ctx {
     uint16_t type;
     int src_port;        // Исходный порт (443)
-    int dest_port;       // Порт minizapret (1083/1084)
+    int dest_port;       // Порт rmf (1083/1084)
 };
 
 extern struct raw_ctx* raw_create(raw_op_t type, int src_port, int dest_port);

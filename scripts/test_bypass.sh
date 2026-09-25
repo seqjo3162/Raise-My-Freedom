@@ -1,7 +1,7 @@
 #!/bin/bash
 URL="${1:-https://discord.com/api/download?platform=linux&format=deb}"
 OUT="/tmp/test_download"
-echo "=== minizapret bypass speed test ==="
+echo "=== rmf bypass speed test ==="
 echo "URL: $URL"
 echo "Start: $(date)"
 echo ""

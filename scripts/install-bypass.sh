@@ -20,30 +20,30 @@ trap rollback ERR
 cd "$ROOT_DIR"
 curl -fsS -m 5 -X POST "$API/api/stopall" >/dev/null 2>&1 || true
 make -j1 core plugs webui
-test -x "$ROOT_DIR/build/bin/minizapret"
-test -x "$ROOT_DIR/build/bin/minizapret-web"
+test -x "$ROOT_DIR/build/bin/rmf"
+test -x "$ROOT_DIR/build/bin/rmf-web"
 
 for pid in $(ps -eo pid,cmd | awk '/[m]inizapret plugin --/ {print $1}'); do kill "$pid" 2>/dev/null || true; done
 for pid in $(ps -eo pid,cmd | awk '/[m]inizapret proxy/ {print $1}'); do kill "$pid" 2>/dev/null || true; done
 for pid in $(ps -eo pid,cmd | awk '/[m]inizapret-web/ {print $1}'); do kill "$pid" 2>/dev/null || true; done
-pkill -KILL -x minizapret 2>/dev/null || true
-pkill -KILL -x minizapret-web 2>/dev/null || true
+pkill -KILL -x rmf 2>/dev/null || true
+pkill -KILL -x rmf-web 2>/dev/null || true
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if ! pgrep -x minizapret >/dev/null 2>&1; then break; fi
+    if ! pgrep -x rmf >/dev/null 2>&1; then break; fi
     sleep 1
 done
 
-for chain in GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS XCOM_BYPASS SPEEDTEST_BYPASS ACTIVISION_BYPASS BATTLENET_BYPASS ELECTRONICARTS_BYPASS EPICGAMES_BYPASS ROBLOX_BYPASS SOUNDCLOUD_BYPASS STEAM_BYPASS TWITCH_BYPASS MINIZAPRET_DNS; do
+for chain in GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS XCOM_BYPASS SPEEDTEST_BYPASS ACTIVISION_BYPASS BATTLENET_BYPASS ELECTRONICARTS_BYPASS EPICGAMES_BYPASS ROBLOX_BYPASS SOUNDCLOUD_BYPASS STEAM_BYPASS TWITCH_BYPASS RMF_DNS; do
     iptables -t nat -D OUTPUT -j "$chain" 2>/dev/null || true
     iptables -t nat -F "$chain" 2>/dev/null || true
     iptables -t nat -X "$chain" 2>/dev/null || true
 done
 
 mkdir -p "$ROOT_DIR/logs"
-nohup env MINIZAPRET_ROOT="$ROOT_DIR" "$ROOT_DIR/build/bin/minizapret-web" >"$ROOT_DIR/logs/minizapret-web.log" 2>&1 &
+nohup env RMF_ROOT="$ROOT_DIR" "$ROOT_DIR/build/bin/rmf-web" >"$ROOT_DIR/logs/rmf-web.log" 2>&1 &
 WEB_PID=$!
 
-LOG="$ROOT_DIR/logs/minizapret-web.log"
+LOG="$ROOT_DIR/logs/rmf-web.log"
 
 ready=0
 for _ in $(seq 1 30); do

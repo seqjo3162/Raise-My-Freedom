@@ -1,4 +1,4 @@
-# minizapret Makefile v3.0 — Plugin Architecture
+# rmf Makefile v3.0 — Plugin Architecture
 # Ядро: main.c + proxy.c + dns_resolve.c (-rdynamic)
 # Плагины: каждый модуль → .xo shared library в plugs/
 
@@ -12,8 +12,8 @@ BUILD_DIR = build
 WEBUI_DIR = webui
 PLUGS_DIR = $(BUILD_DIR)/bin/plugs
 
-MINIZAPRET_BIN = $(BUILD_DIR)/bin/minizapret
-WEBUI_BIN = $(BUILD_DIR)/bin/minizapret-web
+RMF_BIN = $(BUILD_DIR)/bin/rmf
+WEBUI_BIN = $(BUILD_DIR)/bin/rmf-web
 
 MODULES = activision battlenet cloudflaredns discord electronicarts epicgames github google \
           roblox soundcloud speedtestbyookla spotify steam telegram twitch vrchat x
@@ -29,11 +29,11 @@ all: core plugs webui
 # ── Ядро ──────────────────────────────────────────────
 core:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "  🚀 minizapret Core Build"
+	@echo "  🚀 rmf Core Build"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@mkdir -p $(BUILD_DIR)/bin
-	$(CC) -std=gnu11 $(CFLAGS) -rdynamic -o $(MINIZAPRET_BIN) $(CORE_SRC) -ldl
-	@echo "✅ Core: $(MINIZAPRET_BIN)"
+	$(CC) -std=gnu11 $(CFLAGS) -rdynamic -o $(RMF_BIN) $(CORE_SRC) -ldl
+	@echo "✅ Core: $(RMF_BIN)"
 
 # ── Все плагины ──────────────────────────────────────
 plugs: $(addprefix $(PLUGS_DIR)/,$(addsuffix .xo,$(MODULES)))
@@ -85,14 +85,14 @@ $(eval $(call PLUGIN_template,x,xcom,xcom))
 
 # ── List ──────────────────────────────────────────────
 list: core
-	@$(MINIZAPRET_BIN) list
+	@$(RMF_BIN) list
 
 # ── Clean ─────────────────────────────────────────────
 clean:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "  🧹 Clean"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	rm -f $(MINIZAPRET_BIN) $(WEBUI_BIN)
+	rm -f $(RMF_BIN) $(WEBUI_BIN)
 	rm -f $(PLUGS_DIR)/*.xo $(PLUGS_DIR)/*_entry.c
 	@echo "✅ Done"
 

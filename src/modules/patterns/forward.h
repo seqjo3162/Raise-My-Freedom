@@ -20,7 +20,7 @@ typedef enum {
 struct forward_ctx {
     uint16_t type;           // FORWARD_TYPE_IPTABLES или др.
     int src_port;            // Исходный порт (443)
-    int dest_port;           // Порт minizapret (1083/1084)
+    int dest_port;           // Порт rmf (1083/1084)
     char chain[32];          // "PREROUTING" или "OUTPUT"
 };
 

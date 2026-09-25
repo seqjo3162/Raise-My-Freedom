@@ -4,7 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 
-// minizapret Plugin API v1.0
+// rmf Plugin API v1.0
 //
 // Каждый плагин (.xo файл) должен экспортировать 4 функции:
 //   const char* plug_name(void);         - имя плагина
