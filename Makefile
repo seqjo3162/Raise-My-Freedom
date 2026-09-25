@@ -64,7 +64,7 @@ $(PLUGS_DIR)/$(1).xo: $(PLUGS_DIR)/$(1)_entry.c $(filter-out %/test.c, $(wildcar
 endef
 
 # ── Генерация правил для каждого плагина ──────────────
-PLUGIN_LIBS_telegram = -lcrypto -lpthread
+PLUGIN_LIBS_telegram = -lssl -lcrypto -lpthread
 $(eval $(call PLUGIN_template,activision,activision,activision))
 $(eval $(call PLUGIN_template,battlenet,battlenet,battlenet))
 $(eval $(call PLUGIN_template,cloudflaredns,cloudflayerdnscom,cloudflayerdns))
