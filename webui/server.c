@@ -101,21 +101,29 @@ static int start_plugin(const char *name);
 static int stop_plugin(const char *name);
 
 // Конфиг держится рядом с сервером, чтобы его можно было править руками.
-#define TG_CONF_FILE "webui/telegram.conf"
+#define TG_CONF_REL "webui/telegram.conf"
+static char g_tg_conf[560];
 
 typedef struct {
     char secret[128];
     int port;
     int prefer_ipv6;
     int fake_tls;
+    int ws;
 } tg_settings;
 
+static void tg_conf_path(void) {
+    snprintf(g_tg_conf, sizeof(g_tg_conf), "%s/%s", g_project_root, TG_CONF_REL);
+}
+
 static void tg_conf_load(tg_settings *s) {
+    tg_conf_path();
     strncpy(s->secret, "00000000000000000000000000000000", sizeof(s->secret) - 1);
     s->port = 1443;
     s->prefer_ipv6 = 1;
     s->fake_tls = 1;
-    FILE *f = fopen(TG_CONF_FILE, "r");
+    s->ws = 1;
+    FILE *f = fopen(g_tg_conf, "r");
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -129,15 +137,16 @@ static void tg_conf_load(tg_settings *s) {
         else if (!strcmp(line, "port")) s->port = atoi(v);
         else if (!strcmp(line, "prefer_ipv6")) s->prefer_ipv6 = atoi(v);
         else if (!strcmp(line, "fake_tls")) s->fake_tls = atoi(v);
+        else if (!strcmp(line, "ws")) s->ws = atoi(v);
     }
     fclose(f);
 }
 
 static int tg_conf_save(const tg_settings *s) {
-    FILE *f = fopen(TG_CONF_FILE, "w");
+    FILE *f = fopen(g_tg_conf, "w");
     if (!f) return -1;
-    fprintf(f, "secret=%s\nport=%d\nprefer_ipv6=%d\nfake_tls=%d\n",
-            s->secret, s->port, s->prefer_ipv6, s->fake_tls);
+    fprintf(f, "secret=%s\nport=%d\nprefer_ipv6=%d\nfake_tls=%d\nws=%d\n",
+            s->secret, s->port, s->prefer_ipv6, s->fake_tls, s->ws);
     fclose(f);
     return 0;
 }
@@ -152,14 +161,14 @@ static void telegram_settings_json(int fd) {
     snprintf(masked, sizeof(masked), "%.*s%s", (int)(n > 4 ? 4 : n), s.secret,
              n > 4 ? "..." : "");
     snprintf(json, sizeof(json),
-             "{\"secret\":\"%s\",\"secret_len\":%zu,\"port\":%d,\"prefer_ipv6\":%d,\"fake_tls\":%d}",
-             masked, n, s.port, s.prefer_ipv6, s.fake_tls);
+             "{\"secret\":\"%s\",\"secret_len\":%zu,\"port\":%d,\"prefer_ipv6\":%d,\"fake_tls\":%d,\"ws\":%d}",
+             masked, n, s.port, s.prefer_ipv6, s.fake_tls, s.ws);
     send_json(fd, "200 OK", json);
 }
 
 // Применяет настройки и по start=1 перезапускает модуль telegram,
 // чтобы новые параметры гарантированно попали в процесс.
-static int telegram_apply(const char *secret, int port, int v6, int tls, int start,
+static int telegram_apply(const char *secret, int port, int v6, int tls, int ws, int start,
                           char *out, size_t out_size) {
     tg_settings s;
     tg_conf_load(&s);
@@ -185,14 +194,15 @@ static int telegram_apply(const char *secret, int port, int v6, int tls, int sta
     }
     if (v6 >= 0) s.prefer_ipv6 = v6 ? 1 : 0;
     if (tls >= 0) s.fake_tls = tls ? 1 : 0;
+    if (ws >= 0) s.ws = ws ? 1 : 0;
 
     if (tg_conf_save(&s) != 0) {
-        snprintf(out, out_size, "{\"ok\":false,\"error\":\"не удалось записать %s\"}", TG_CONF_FILE);
+        snprintf(out, out_size, "{\"ok\":false,\"error\":\"не удалось записать %s\"}", TG_CONF_REL);
         return -1;
     }
     char msg[160];
-    snprintf(msg, sizeof(msg), "[telegram] настройки сохранены: :%d, x6=%d, fake_tls=%d",
-             s.port, s.prefer_ipv6, s.fake_tls);
+    snprintf(msg, sizeof(msg), "[telegram] настройки сохранены: :%d, x6=%d, fake_tls=%d, ws=%d",
+             s.port, s.prefer_ipv6, s.fake_tls, s.ws);
     log_add(msg);
 
     if (start) {
@@ -203,8 +213,8 @@ static int telegram_apply(const char *secret, int port, int v6, int tls, int sta
                  r == 0 ? "ok" : (r == -2 ? "уже запущен" : "ошибка"));
         log_add(msg);
     }
-    snprintf(out, out_size, "{\"ok\":true,\"port\":%d,\"prefer_ipv6\":%d,\"fake_tls\":%d}",
-             s.port, s.prefer_ipv6, s.fake_tls);
+    snprintf(out, out_size, "{\"ok\":true,\"port\":%d,\"prefer_ipv6\":%d,\"fake_tls\":%d,\"ws\":%d}",
+             s.port, s.prefer_ipv6, s.fake_tls, s.ws);
     return 0;
 }
 
@@ -244,7 +254,7 @@ static int ctor_validate_json(const char *spec, char *out, size_t cap) {
     ssize_t w = write(tf, spec, strlen(spec));
     close(tf);
     if (w < 0) { unlink(tmp); return -1; }
-    char cmd[1024];
+    char cmd[1200];
     snprintf(cmd, sizeof(cmd), "%s < %s 2>/dev/null", VALIDATOR_BIN, tmp);
     FILE *p = popen(cmd, "r");
     if (!p) { unlink(tmp); return -1; }
@@ -776,7 +786,7 @@ static int do_backup(void) {
     struct tm *t = localtime(&now);
     snprintf(dst, sizeof(dst), BACKUP_DIR "/rmf_%04d%02d%02d_%02d%02d%02d.tar.gz",
         t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
-    char cmd[1024];
+    char cmd[1200];
     snprintf(cmd, sizeof(cmd), "tar czf %s --exclude='%s' --exclude='build' -C . . 2>/dev/null", dst, BACKUP_DIR);
     int r = spawn_shell(cmd);
     char timebuf[64];
@@ -963,9 +973,9 @@ static void handle_request(int fd) {
     } else if (strcmp(path, "/api/telegram") == 0) {
         telegram_settings_json(fd);
     } else if (strncmp(path, "/api/telegram", 12) == 0) {
-        // POST /api/telegram?secret=...&port=...&prefer_ipv6=0|1&fake_tls=0|1
+        // POST /api/telegram?secret=...&port=...&prefer_ipv6=0|1&fake_tls=0|1&ws=0|1
         char secret[128] = {0};
-        int port = 0, v6 = -1, tls = -1, started = 0;
+        int port = 0, v6 = -1, tls = -1, ws = -1, started = 0;
         const char *sp = strstr(path, "secret=");
         if (sp) {
             const char *end = strchr(sp + 7, '&');
@@ -980,11 +990,14 @@ static void handle_request(int fd) {
         if (vp) v6 = atoi(vp + 12);
         const char *tp = strstr(path, "fake_tls=");
         if (tp) tls = atoi(tp + 9);
+        const char *wsp = strstr(path, "&ws=");
+        if (!wsp) wsp = strstr(path, "ws=");
+        if (wsp) ws = atoi(wsp + 3);
         const char *stp = strstr(path, "start=");
         if (stp) started = atoi(stp + 6);
 
         char msg[256] = {0};
-        int r = telegram_apply(secret, port, v6, tls, started, msg, sizeof(msg));
+        int r = telegram_apply(secret, port, v6, tls, ws, started, msg, sizeof(msg));
         send_json(fd, r == 0 ? "200 OK" : "400 Bad Request", msg);
     } else if (strcmp(path, "/api/plugins") == 0) {
         char json[4096];
@@ -1023,7 +1036,7 @@ static void handle_request(int fd) {
             close(fd);
             return;
         }
-        char cmd[1024];
+        char cmd[1200];
         if (plugin[0]) snprintf(cmd, sizeof(cmd), "cd %s && make build/bin/plugs/%s.xo 2>&1", g_project_root, canonical_name);
         else snprintf(cmd, sizeof(cmd), "cd %s && make core plugs webui 2>&1", g_project_root);
         int r = spawn_shell(cmd);

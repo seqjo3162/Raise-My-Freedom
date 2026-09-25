@@ -14,31 +14,11 @@
 static telegram_ctx_t ctx = {0};
 static bool telegram_initialized = false;
 
-// домены Telegram: клиент обращается напрямую, трафик заворачиваем на релей
-static const char *tg_domains[] = {
-    "telegram.org", "www.telegram.org", "web.telegram.org", "k telegram.org",
-    "t.me", "core.telegram.org", NULL
-};
-
 telegram_ctx_t *telegram_get_ctx(void) { return &ctx; }
-
-static int is_root(void) { return getuid() == 0; }
-
-static void sh(const char *cmd) {
-    int rc = system(cmd);
-    (void)rc;
-}
-
-static void sh_check(const char *cmd) {
-    int rc = system(cmd);
-    if (rc == -1) fprintf(stderr, "[TG] iptables: не удалось выполнить: %s\n", cmd);
-    else if (WIFEXITED(rc) && WEXITSTATUS(rc) != 0)
-        fprintf(stderr, "[TG] iptables: ошибка %d: %s\n", WEXITSTATUS(rc), cmd);
-}
 
 // Читает webui/telegram.conf. main.c вызывает plugin.init(NULL), поэтому
 // без этого все настройки из веб-интерфейса оставались бы незамеченными.
-static void load_conf(char *secret, size_t secret_size, int *port, int *v6, int *tls) {
+static void load_conf(char *secret, size_t secret_size, int *port, int *v6, int *tls, int *ws) {
     FILE *f = fopen(TG_CONF_FILE, "r");
     if (!f) return;
     char line[256];
@@ -57,6 +37,8 @@ static void load_conf(char *secret, size_t secret_size, int *port, int *v6, int 
             *v6 = atoi(v) ? 1 : 0;
         else if (!strcmp(line, "fake_tls"))
             *tls = atoi(v) ? 1 : 0;
+        else if (!strcmp(line, "ws"))
+            *ws = atoi(v) ? 1 : 0;
     }
     fclose(f);
 }
@@ -66,14 +48,15 @@ void telegram_module_init(telegram_config_t *config) {
 
     // 1) значения из файла — база
     char secret[64] = {0};
-    int fport = TG_PROXY_PORT, fv6 = 1, ftls = 1;
-    load_conf(secret, sizeof(secret), &fport, &fv6, &ftls);
+    int fport = TG_PROXY_PORT, fv6 = 1, ftls = 1, fws = 1;
+    load_conf(secret, sizeof(secret), &fport, &fv6, &ftls, &fws);
 
     // 2) явный конфиг от вызывающего кода важнее файла
     if (config) {
         if (config->proxy_port > 0)    fport = config->proxy_port;
         if (config->prefer_ipv6 >= 0)  fv6 = config->prefer_ipv6 ? 1 : 0;
         if (config->use_fake_tls >= 0) ftls = config->use_fake_tls ? 1 : 0;
+        if (config->use_ws >= 0) fws = config->use_ws ? 1 : 0;
     }
     if (secret[0]) telegram_proxy_set_secret(secret);
 
@@ -88,6 +71,7 @@ void telegram_module_init(telegram_config_t *config) {
     ctx.proxy_port   = fport;
     ctx.prefer_ipv6  = fv6;
     ctx.use_fake_tls = ftls;
+    ctx.use_ws = fws;
     ctx.mode = 0;
     ctx.socket_fd = -1;
     ctx.listen_fd = -1;
@@ -96,10 +80,10 @@ void telegram_module_init(telegram_config_t *config) {
 
     telegram_initialized = true;
     // секрет показываем маской: он должен совпадать с тем, что введён в Telegram
-    printf("[telegram] init: DNS %s / %s, MTProxy :%d (x6=%d x4=%d), mode=%s, secret=%s\n",
+    printf("[telegram] init: DNS %s / %s, MTProxy :%d (x6=%d x4=%d), mode=%s/%s, secret=%s\n",
            ctx.primary, ctx.fallback, ctx.proxy_port, 6, 4,
            ctx.use_fake_tls ? "fake-TLS" : "classic",
-           secret[0] ? secret : "(встроенный)");
+           ctx.use_ws ? "WS" : "TCP", secret[0] ? "<configured>" : "<built-in>");
 }
 
 void telegram_module_inject(int fd) {
@@ -136,5 +120,5 @@ void telegram_module_cleanup(void) {
 const char *telegram_get_status(void) {
     if (!telegram_initialized) return "Off";
     if (!ctx.mode) return "Idle";
-    return telegram_proxy_running() ? "Active (MTProxy)" : "Active (MTProxy down!)";
+    return telegram_proxy_running() ? "Active (MTProxy/WS)" : "Active (MTProxy down!)";
 }

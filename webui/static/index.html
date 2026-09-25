@@ -119,7 +119,8 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
       <label>Режим</label>
       <div class="checkrow">
         <label class="chk"><input type="checkbox" id="tgTls" checked> fake-TLS</label>
-        <span class="hint" style="margin:0">выключите, если клиент не заходит</span>
+        <label class="chk"><input type="checkbox" id="tgWs" checked> WebSocket</label>
+        <span class="hint" style="margin:0">WS через kws*.web.telegram.org, иначе TCP к ДЦ</span>
       </div>
 
       <label></label>
@@ -222,7 +223,7 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
 <script>
 const BYPASS = {
   discord:'SNI-split relay + DNS pinning',vrchat:'DNS pinning + iptables DNAT',
-  telegram:'MTProxy (SNI-fake-TLS)',x:'SNI-split relay + DoH/DNS pinning',
+  telegram:'MTProxy (WebSocket + SNI-fake-TLS)',x:'SNI-split relay + DoH/DNS pinning',
   github:'DoH-резолв против подмены DNS',
   google:'DNS bypass',twitch:'',spotify:'',steam:'',
   epicgames:'',roblox:'',soundcloud:'',speedtestbyookla:'',
@@ -401,8 +402,9 @@ async function loadTelegram(){
     document.getElementById('tgIpv6').checked=!!r.prefer_ipv6;
     document.getElementById('tgX4').checked=true;
     document.getElementById('tgTls').checked=!!r.fake_tls;
+    document.getElementById('tgWs').checked=!!r.ws;
     document.getElementById('tgSecret').placeholder='(текущий: '+r.secret+', длина '+r.secret_len+')';
-    document.getElementById('tgStatus').textContent='текущий порт: '+r.port+' · секрет: '+r.secret+' · fake-TLS: '+(r.fake_tls?'вкл':'выкл');
+    document.getElementById('tgStatus').textContent='текущий порт: '+r.port+' · секрет: '+r.secret+' · fake-TLS: '+(r.fake_tls?'вкл':'выкл')+' · WS: '+(r.ws?'вкл':'выкл');
   }
   document.getElementById('tgState').textContent=isRunning('telegram')?'работает':'остановлен';
   document.getElementById('tgState').style.color=isRunning('telegram')?'#3fb950':'#484f58';
@@ -419,7 +421,8 @@ async function saveTelegram(restart){
   const port=document.getElementById('tgPort').value;
   const v6=document.getElementById('tgIpv6').checked?1:0;
   const tls=document.getElementById('tgTls').checked?1:0;
-  let url='telegram?port='+encodeURIComponent(port)+'&prefer_ipv6='+v6+'&fake_tls='+tls+'&start='+(restart?1:0);
+  const ws=document.getElementById('tgWs').checked?1:0;
+  let url='telegram?port='+encodeURIComponent(port)+'&prefer_ipv6='+v6+'&fake_tls='+tls+'&ws='+ws+'&start='+(restart?1:0);
   if(secret)url+='&secret='+encodeURIComponent(secret);
   const r=await api(url,{method:'POST'});
   if(r.ok){toast(restart?'Настройки сохранены, прокси перезапущен':'Настройки сохранены',true);setTimeout(()=>{loadTelegram();loadLogs()},600);}

@@ -24,6 +24,7 @@ typedef struct {
     int proxy_port;             // локальный порт proxy, по умолчанию 1443
     int prefer_ipv6;            // 1 = x6 first, затем x4 (пул x6-x4)
     int use_fake_tls;           // 1 = intermediate-режим с поддельным TLS
+    int use_ws;                 // 1 = WebSocket transport с fallback на TCP
 } telegram_config_t;
 
 typedef struct {
@@ -34,6 +35,7 @@ typedef struct {
     int proxy_port;
     int prefer_ipv6;
     int use_fake_tls;
+    int use_ws;
     int listen_fd;
     pid_t relay_pid;
     int relay_running;
