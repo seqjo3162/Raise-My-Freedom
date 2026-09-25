@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>minizapret Web UI</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>minizapret Web UI</h1>
+            <p class="subtitle">Умный DNS прокси с управлением модулями</p>
+        </header>
+
+        <div class="status-bar">
+            <div class="status-indicator">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Ожидание запуска...</span>
+            </div>
+            <div id="connectionInfo"><span style="color:#a0aec0">Порт DNS: 53</span> | Upstream: <span style="color:#feca57">127.0.0.1</span></div>
+        </div>
+
+        <div class="modules-grid" id="modulesGrid"></div>
+
+        <div class="settings-panel">
+            <h2>Настройки</h2>
+            
+            <div class="form-group">
+                <label for="proxyName">Название прокси (опционально):</label>
+                <input type="text" id="proxyName" class="form-control" placeholder="Мой DNS прокси">
+            </div>
+
+            <div class="service-editor">
+                <h3>Список сервисов (доменов):</h3>
+                <div id="serviceList"></div>
+                <button onclick="addService()" class="btn btn-add">Добавить сервис</button>
+            </div>
+
+            <div class="form-group">
+                <label for="cidrRanges">CIDR диапазоны (через запятую):</label>
+                <textarea id="cidrRanges" class="form-control" placeholder="192.168.0.0/24, 10.0.0.0/8, 172.16.0.0/12"></textarea>
+            </div>
+
+            <button onclick="saveSettings()" class="btn btn-primary">Сохранить</button>
+            <button onclick="loadSettings()" class="btn btn-primary" style="background: linear-gradient(90deg, #48bb78, #68d391);">Загрузить</button>
+        </div>
+
+        <footer>
+            <p>minizapret Web UI | Pure C Backend</p>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

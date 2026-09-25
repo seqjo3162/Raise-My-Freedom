@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>minizapret</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;display:flex;justify-content:center;padding:24px}
+.container{max-width:1100px;width:100%}
+h1{font-size:18px;font-weight:600;margin-bottom:16px;color:#58a6ff}
+.tabs{display:flex;gap:2px;border-bottom:1px solid #21262d;margin-bottom:16px}
+.tab{padding:8px 16px;font-size:13px;color:#8b949e;cursor:pointer;border:1px solid transparent;border-bottom:none;border-radius:6px 6px 0 0;background:transparent}
+.tab:hover{color:#c9d1d9}
+.tab.on{color:#58a6ff;background:#161b22;border-color:#30363d}
+.tabpage{display:none}.tabpage.on{display:block}
+table{width:100%;border-collapse:collapse;margin-bottom:16px;border:1px solid #21262d;border-radius:8px;overflow:hidden}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e;padding:10px 14px;background:#161b22;border-bottom:1px solid #21262d}
+td{padding:8px 14px;border-bottom:1px solid #21262d;font-size:13px;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover{background:#161b2288}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot.on{background:#3fb950;box-shadow:0 0 6px #3fb95066}
+.dot.off{background:#484f58}
+.btn{padding:5px 12px;border:none;border-radius:5px;font-size:11px;font-weight:500;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-go{background:#238636;color:#fff}.btn-go:hover{background:#2ea043}
+.btn-stop{background:#da3633;color:#fff}.btn-stop:hover{background:#f85149}
+.btn-rebuild{background:#1f6feb;color:#fff}.btn-rebuild:hover{background:#388bfd}
+.btn-dim{background:#30363d;color:#c9d1d9;border:1px solid #484f58}.btn-dim:hover{background:#484f58}
+.btn-danger{background:#da363388;color:#f85149;border:1px solid #da3633}.btn-danger:hover{background:#da3633;color:#fff}
+.btn-ghost{background:transparent;color:#8b949e;border:1px solid #30363d;font-size:10px;padding:3px 8px}.btn-ghost:hover{background:#30363d}
+.bypass-tag{font-size:10px;padding:2px 8px;border-radius:10px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44}
+.panel{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:16px}
+.panel-hdr{padding:8px 14px;font-size:12px;font-weight:600;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center;color:#8b949e}
+.log-box{height:calc(100vh - 260px);min-height:300px;overflow-y:auto;font-family:'Cascadia Code','Fira Code',monospace;font-size:11px;line-height:1.6;padding:10px 14px;white-space:pre-wrap;word-break:break-all}
+.log-box::-webkit-scrollbar{width:5px}
+.log-box::-webkit-scrollbar-track{background:#161b22}
+.log-box::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+.toast{position:fixed;bottom:20px;right:20px;padding:8px 14px;border-radius:5px;font-size:12px;color:#fff;opacity:0;transition:opacity .3s;z-index:99}
+.toast.show{opacity:1}.toast.ok{background:#238636}.toast.err{background:#da3633}
+.toolbar{display:flex;gap:8px;margin-bottom:16px;justify-content:space-between;align-items:center;flex-wrap:wrap}
+.toolbar-r{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.actions{display:flex;gap:4px}
+.form{display:grid;grid-template-columns:200px 1fr;gap:12px 16px;align-items:center;padding:16px}
+label{font-size:12px;color:#8b949e}
+input[type=text],input[type=number],input[type=password],select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:5px;font-size:12px;width:100%;font-family:inherit}
+input:focus,select:focus{outline:none;border-color:#1f6feb}
+.hint{font-size:11px;color:#484f58;margin-top:4px;line-height:1.5}
+.checkrow{display:flex;gap:16px;align-items:center}
+.chk{display:flex;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;cursor:pointer}
+.statusline{font-size:12px;color:#8b949e;padding:10px 16px;border-top:1px solid #21262d}
+.filterbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.filterbar select,.filterbar input{width:auto;min-width:150px}
+.count{font-size:11px;color:#484f58;margin-left:auto}
+code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3px;font-size:11px}
+.fld{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#8b949e}
+.fld>span{color:#8b949e}
+.fld input,.fld select{padding:7px 9px;font-size:13px}
+.dg{border-left:3px solid #30363d;padding:7px 10px;margin-bottom:6px;background:#0d1117;border-radius:0 5px 5px 0;font-size:13px}
+.dg .step{color:#484f58;font-size:11px;margin-left:6px}
+.dg .hint{color:#d29922;margin-top:4px;font-size:12px}
+.dg.ok{border-color:#238636}.dg.ok .msg{color:#7ee787}
+.dg.warn{border-color:#9e6a03}.dg.warn .msg{color:#e3b341}
+.dg.error{border-color:#da3633}.dg.error .msg{color:#ff7b72}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>minizapret</h1>
+
+<div class="tabs">
+  <div class="tab on" data-tab="modules" onclick="switchTab('modules')">Модули</div>
+  <div class="tab" data-tab="telegram" onclick="switchTab('telegram')">Telegram · MTProxy</div>
+  <div class="tab" data-tab="logs" onclick="switchTab('logs')">Логи</div>
+  <div class="tab" data-tab="ctor" onclick="switchTab('ctor')">Конструктор</div>
+</div>
+
+<!-- ══════════ Модули ══════════ -->
+<div class="tabpage on" id="page-modules">
+  <div class="toolbar">
+    <div class="toolbar-r">
+      <button class="btn btn-dim" onclick="loadPlugins()">Refresh list</button>
+      <button class="btn btn-danger" onclick="flushIptables()">Flush iptables</button>
+      <button class="btn btn-dim" onclick="stopAll()">Stop all</button>
+      <button class="btn btn-dim" onclick="loadBackup()">Backup</button>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th style="width:36px">Status</th><th>Module</th><th>Bypass type</th><th style="width:180px"></th></tr></thead>
+    <tbody id="rows"><tr><td colspan="4" style="color:#484f58">loading...</td></tr></tbody>
+  </table>
+</div>
+
+<!-- ══════════ Telegram / MTProxy ══════════ -->
+<div class="tabpage" id="page-telegram">
+  <div class="panel">
+    <div class="panel-hdr"><span>MTProxy — отдельный прокси Telegram</span><span id="tgState" style="color:#484f58">—</span></div>
+    <div class="form">
+      <label>Секрет (32 hex)</label>
+      <div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="tgSecret" placeholder="00000000000000000000000000000000" spellcheck="false" style="flex:1">
+          <button class="btn btn-dim" onclick="genTgSecret()" title="Сгенерировать 16 случайных байт">Обновить</button>
+          <button class="btn btn-go" onclick="saveTelegram(1)">Применить</button>
+        </div>
+        <div class="hint">Этот же секрет вводится в Telegram: Settings → Advanced → Connection type → Use custom proxy. В приложении: <code>1443</code> и адрес вашего сервера.</div>
+      </div>
+
+      <label>Порт прослушивания</label>
+      <div><input type="number" id="tgPort" value="1443" min="1024" max="65535"></div>
+
+      <label>Пул соединений</label>
+      <div class="checkrow">
+        <label class="chk"><input type="checkbox" id="tgIpv6" checked> x6 (6 соединений)</label>
+        <label class="chk"><input type="checkbox" id="tgX4" checked> x4 (4 соединения)</label>
+        <span class="hint" style="margin:0">приоритет IPv6 к ДЦ Telegram</span>
+      </div>
+
+      <label>Режим</label>
+      <div class="checkrow">
+        <label class="chk"><input type="checkbox" id="tgTls" checked> fake-TLS</label>
+        <span class="hint" style="margin:0">выключите, если клиент не заходит</span>
+      </div>
+
+      <label></label>
+      <div>
+        <button class="btn btn-go" onclick="saveTelegram(1)">Сохранить и перезапустить</button>
+        <button class="btn btn-dim" onclick="saveTelegram(0)">Только сохранить</button>
+      </div>
+    </div>
+    <div class="statusline" id="tgStatus">—</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-hdr"><span>Как подключить</span></div>
+    <div class="form">
+      <label>Веб-версия</label>
+      <div class="hint" style="font-size:12px;color:#c9d1d9">
+        Откройте <code>https://web.telegram.org/</code> в браузере, войдите и в настройках
+        укажите SOCKS5: хост = адрес этой машины, порт = <b>1443</b>.
+        Либо в приложении: Advanced → Connection type → «Use custom proxy» → SOCKS5, порт 1443.
+        <br><br>Порт и адрес впишите те, что реально открыты наружу: если вы за NAT,
+        проброс нужно сделать на роутере (TCP 1443).
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ Логи ══════════ -->
+<div class="tabpage" id="page-logs">
+  <div class="toolbar">
+    <div class="filterbar">
+      <select id="logTag" onchange="loadLogs()"><option value="">Все сервисы</option></select>
+      <input type="text" id="logQ" placeholder="поиск по тексту..." oninput="debouncedLoadLogs()" style="min-width:220px">
+      <input type="number" id="logLimit" placeholder="лимит" value="300" style="width:90px" oninput="debouncedLoadLogs()">
+      <label class="chk"><input type="checkbox" id="logAuto" checked onchange="scheduleRefresh()"> авто</label>
+      <button class="btn btn-dim" onclick="loadLogs()">Обновить</button>
+      <button class="btn btn-ghost" onclick="clearLogBox()">Очистить вид</button>
+      <span class="count" id="logCount">—</span>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-hdr"><span>Журнал</span><span id="logMeta" style="color:#484f58"></span></div>
+    <div class="log-box" id="logBox">Загрузка...</div>
+  </div>
+</div>
+
+<div class="tabpage" id="page-ctor">
+  <div class="panel">
+    <div class="panel-hdr"><span>Новый модуль</span><span style="color:#484f58">всё настраивается здесь, без правки кода</span></div>
+    <div style="padding:14px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <label class="fld"><span>Имя модуля</span><input id="cName" value="mysite" placeholder="mysite"></label>
+        <label class="fld"><span>Цепочка iptables</span><input id="cChain" value="MYSITE" placeholder="MY_SITE"></label>
+      </div>
+      <label class="fld" style="margin-top:12px"><span>Домены (через запятую)</span><input id="cDomains" value="discord.com,discord.gg" placeholder="example.com"></label>
+
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:12px">
+        <label class="fld"><span>Режим</span><select id="cMode" onchange="ctorSyncMode()">
+          <option value="0">DNS-пиннинг</option>
+          <option value="1" selected>Релей + SNI-разрез</option>
+          <option value="2">MTProto</option>
+        </select></label>
+        <label class="fld"><span>DNS-порт</span><input id="cDnsPort" type="number" value="1053"></label>
+        <label class="fld"><span>Порт релея</span><input id="cRelayPort" type="number" value="18443"></label>
+      </div>
+
+      <div id="ctorFrag" style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:12px">
+        <label class="fld"><span>Первый сегмент, Б</span><input id="cFrag" type="number" value="20"></label>
+        <label class="fld"><span>Пауза, мс</span><input id="cDelay" type="number" value="30"></label>
+        <label class="fld"><span>Метка iptables</span><input id="cMark" type="number" value="20100"></label>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+        <label class="fld"><span>Основной DNS</span><input id="cPrimary" value="1.1.1.1"></label>
+        <label class="fld"><span>Запасной DNS</span><input id="cFallback" value="8.8.8.8"></label>
+      </div>
+
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+        <button class="btn" onclick="ctorCheck()">Проверить</button>
+        <button class="btn btn-ghost" onclick="ctorSave()">Сохранить и запустить</button>
+        <span class="count" id="ctorSummary">—</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-hdr"><span>Результат проверки</span><span id="ctorMeta" style="color:#484f58"></span></div>
+    <div id="ctorOut" class="log-box" style="max-height:420px">Нажмите «Проверить» — покажу, на каком шаге модуль ломается и что исправить.</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-hdr"><span>Сохранённые модули</span></div>
+    <div id="ctorList" style="padding:12px;color:#8b949e;font-size:13px">загрузка...</div>
+    <div style="padding:0 12px 12px;color:#484f58;font-size:12px">нажмите на модуль, чтобы загрузить его настройки в форму</div>
+  </div>
+</div>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const BYPASS = {
+  discord:'SNI-split relay + DNS pinning',vrchat:'DNS pinning + iptables DNAT',
+  telegram:'MTProxy (SNI-fake-TLS)',x:'SNI-split relay + DoH/DNS pinning',
+  github:'DoH-резолв против подмены DNS',
+  google:'DNS bypass',twitch:'',spotify:'',steam:'',
+  epicgames:'',roblox:'',soundcloud:'',speedtestbyookla:'',
+  electronicarts:'',battlenet:'',activision:'',cloudflaredns:'',
+  custom:'модуль из конструктора'
+};
+};
+const NAMES = {x:'X',roblox:'Roblox',soundcloud:'SoundCloud',cloudflaredns:'Cloudflare DNS',telegram:'Telegram',custom:'Конструктор'};
+
+let allPlugins=[], statusData={proxy:false,plugins:[]};
+let activeTab='modules', logTimer=null, lastLogSig='';
+
+
+function ctorSpec(){
+  return {
+    name: document.getElementById('cName').value.trim(),
+    chain: document.getElementById('cChain').value.trim(),
+    domains: document.getElementById('cDomains').value.split(',').map(s=>s.trim()).filter(Boolean),
+    mode: parseInt(document.getElementById('cMode').value,10),
+    dns_port: parseInt(document.getElementById('cDnsPort').value,10)||0,
+    relay_port: parseInt(document.getElementById('cRelayPort').value,10)||0,
+    mark: parseInt(document.getElementById('cMark').value,10)||0,
+    primary_dns: document.getElementById('cPrimary').value.trim(),
+    fallback_dns: document.getElementById('cFallback').value.trim(),
+    frag_first_seg: parseInt(document.getElementById('cFrag').value,10)||20,
+    frag_delay_ms: parseInt(document.getElementById('cDelay').value,10)||30
+  };
+}
+function ctorSyncMode(){
+  const m=parseInt(document.getElementById('cMode').value,10);
+  document.getElementById('ctorFrag').style.display=(m===1)?'grid':'none';
+}
+function ctorRender(d){
+  const out=document.getElementById('ctorOut');
+  const box=d.diags||[];
+  if(!box.length){out.textContent='нет результатов';return}
+  out.innerHTML=box.map(x=>
+    '<div class="dg '+x.level+'"><span class="msg">'+x.msg+'</span><span class="step">['+x.step+']</span>'+
+    (x.hint?'<div class="hint">\u2192 '+x.hint+'</div>':'')+'</div>').join('');
+  document.getElementById('ctorSummary').textContent=d.summary||'';
+  document.getElementById('ctorMeta').textContent=d.ok?'прошёл':'есть ошибки';
+}
+function ctorCheck(){
+  const out=document.getElementById('ctorOut');
+  out.textContent='проверяю...';
+  fetch('/api/constructor/validate',{method:'POST',body:JSON.stringify(ctorSpec())})
+    .then(r=>r.json()).then(ctorRender)
+    .catch(e=>{out.textContent='ошибка запроса: '+e});
+}
+function ctorSave(){
+  const out=document.getElementById('ctorOut');
+  out.textContent='проверяю и сохраняю...';
+  fetch('/api/constructor/save',{method:'POST',body:JSON.stringify(ctorSpec())})
+    .then(r=>r.json()).then(d=>{
+      if(d.saved){
+        ctorRender(d.check);
+        ctorLoadList();
+        fetch('/api/start?plugin=custom')
+          .then(r=>r.json())
+          .then(x=>{const ok=x&&x.ok!==false;toast(ok?'модуль '+d.saved.name+' сохранён и запущен':'сохранён, но запуск не удался',ok)})
+          .catch(()=>toast('сохранён, запуск недоступен',false));
+      }
+      else{ctorRender(d);toast('не сохранено — есть ошибки',false)}
+    }).catch(e=>{out.textContent='ошибка запроса: '+e});
+}
+function ctorLoad(name){
+  fetch('/api/constructor/load?name='+encodeURIComponent(name)).then(r=>r.json()).then(d=>{
+    document.getElementById('cName').value=d.name||name;
+    document.getElementById('cChain').value=d.chain||'';
+    document.getElementById('cDomains').value=(d.domains||[]).join(',');
+    document.getElementById('cMode').value=String(d.mode||0);
+    document.getElementById('cDnsPort').value=d.dns_port||1053;
+    document.getElementById('cRelayPort').value=d.relay_port||18443;
+    document.getElementById('cMark').value=d.mark||20100;
+    document.getElementById('cPrimary').value=d.primary_dns||'1.1.1.1';
+    document.getElementById('cFallback').value=d.fallback_dns||'8.8.8.8';
+    document.getElementById('cFrag').value=d.frag_first_seg||20;
+    document.getElementById('cDelay').value=d.frag_delay_ms||30;
+    ctorSyncMode();
+    toast('модуль '+name+' загружен в форму',true);
+  }).catch(()=>toast('не удалось загрузить',false));
+}
+function ctorLoadList(){
+  fetch('/api/constructor/list').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('ctorList');
+    if(!(d.modules||[]).length){el.textContent='пока пусто — сохраните первый модуль';return}
+    el.innerHTML=d.modules.map(m=>'<span onclick="ctorLoad(&quot;'+m.name+'&quot;)" style="display:inline-block;padding:4px 9px;margin:0 6px 6px 0;background:#161b22;border:1px solid #30363d;border-radius:5px;cursor:pointer">'+m.name+'</span>').join('');
+  }).catch(()=>{});
+}
+
+function switchTab(name){
+  activeTab=name;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===name));
+  document.querySelectorAll('.tabpage').forEach(p=>p.classList.toggle('on',p.id==='page-'+name));
+  if(name==='ctor'){ctorSyncMode();ctorLoadList()}
+  if(name==='logs'){loadLogTags();loadLogs();}
+  if(name==='telegram') loadTelegram();
+}
+
+function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(ok?'ok':'err');setTimeout(()=>t.className='toast',2500)}
+function isRunning(name){return statusData.plugins.some(p=>p.name===name&&p.active)}
+
+function renderTable(){
+  const tbody=document.getElementById('rows');
+  tbody.innerHTML='';
+  if(!allPlugins.length){tbody.innerHTML='<tr><td colspan="4" style="color:#484f58">no plugins</td></tr>';return;}
+  allPlugins.forEach(p=>{
+    const running=isRunning(p);
+    const type=BYPASS[p]||'DNS bypass';
+    const tr=document.createElement('tr');
+    tr.innerHTML=
+      '<td><span class="dot '+(running?'on':'off')+'"></span></td>'+
+      '<td>'+(NAMES[p]||p)+'</td>'+
+      '<td><span class="bypass-tag">'+type+'</span></td>'+
+      '<td><div class="actions">'+
+      (running?'<button class="btn btn-stop" onclick="doStop(\''+p+'\')">Stop</button>'
+              :'<button class="btn btn-go" onclick="doStart(\''+p+'\')">Start</button>')+
+      '<button class="btn btn-rebuild" onclick="doRebuild(\''+p+'\')" title="Rebuild">R</button>'+
+      '</div></td>';
+    tbody.appendChild(tr);
+  });
+}
+
+async function api(path,opt){
+  try{const r=await fetch('/api/'+path,opt);return await r.json()}catch(e){return{ok:false,error:e.message}}
+}
+
+async function loadPlugins(){const r=await api('plugins');allPlugins=Array.isArray(r)?r:[];renderTable()}
+async function loadStatus(){const r=await api('status');statusData=r&&r.plugins?r:{proxy:false,plugins:[]};renderTable()}
+
+/* ─────────── Логи с фильтрами ─────────── */
+async function loadLogTags(){
+  const r=await api('logs/tags');
+  const sel=document.getElementById('logTag');
+  const cur=sel.value;
+  sel.innerHTML='<option value="">Все сервисы</option>';
+  (r.tags||[]).forEach(t=>{
+    const o=document.createElement('option');o.value=t;o.textContent=t;sel.appendChild(o);
+  });
+  sel.value=cur;
+}
+function logQuery(){
+  const p=new URLSearchParams();
+  const tag=document.getElementById('logTag').value;
+  const q=document.getElementById('logQ').value.trim();
+  const lim=document.getElementById('logLimit').value.trim();
+  if(tag)p.set('tag',tag);
+  if(q)p.set('q',q);
+  if(lim)p.set('limit',lim);
+  const s=p.toString();
+  return s?('?'+s):'';
+}
+async function loadLogs(){
+  const b=document.getElementById('logBox');
+  const r=await api('logs'+logQuery());
+  const logs=Array.isArray(r)?r:[];
+  const sig=logs.join('\n');
+  if(sig===lastLogSig)return;
+  lastLogSig=sig;
+  if(!logs.length){b.innerHTML='<span style="color:#484f58">нет записей по фильтру</span>';}
+  else b.textContent=logs.join('\n');
+  b.scrollTop=b.scrollHeight;
+  document.getElementById('logCount').textContent=logs.length+' записей';
+  const tag=document.getElementById('logTag').value,q=document.getElementById('logQ').value;
+  document.getElementById('logMeta').textContent=(tag?('сервис: '+tag+' · '):'')+(q?('поиск: '+q+' · '):'');
+}
+function clearLogBox(){document.getElementById('logBox').textContent='';lastLogSig='';document.getElementById('logCount').textContent='0 записей'}
+let debTimer=null;
+function debouncedLoadLogs(){clearTimeout(debTimer);debTimer=setTimeout(loadLogs,350)}
+
+/* ─────────── Telegram ─────────── */
+async function loadTelegram(){
+  const r=await api('telegram');
+  if(r&&r.port){
+    document.getElementById('tgPort').value=r.port;
+    document.getElementById('tgIpv6').checked=!!r.prefer_ipv6;
+    document.getElementById('tgX4').checked=true;
+    document.getElementById('tgTls').checked=!!r.fake_tls;
+    document.getElementById('tgSecret').placeholder='(текущий: '+r.secret+', длина '+r.secret_len+')';
+    document.getElementById('tgStatus').textContent='текущий порт: '+r.port+' · секрет: '+r.secret+' · fake-TLS: '+(r.fake_tls?'вкл':'выкл');
+  }
+  document.getElementById('tgState').textContent=isRunning('telegram')?'работает':'остановлен';
+  document.getElementById('tgState').style.color=isRunning('telegram')?'#3fb950':'#484f58';
+}
+function genTgSecret(){
+  const b=new Uint8Array(16);
+  crypto.getRandomValues(b);
+  const hex=Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');
+  document.getElementById('tgSecret').value=hex;
+  toast('Новый секрет сгенерирован. Нажмите «Применить».',true);
+}
+async function saveTelegram(restart){
+  const secret=document.getElementById('tgSecret').value.trim();
+  const port=document.getElementById('tgPort').value;
+  const v6=document.getElementById('tgIpv6').checked?1:0;
+  const tls=document.getElementById('tgTls').checked?1:0;
+  let url='telegram?port='+encodeURIComponent(port)+'&prefer_ipv6='+v6+'&fake_tls='+tls+'&start='+(restart?1:0);
+  if(secret)url+='&secret='+encodeURIComponent(secret);
+  const r=await api(url,{method:'POST'});
+  if(r.ok){toast(restart?'Настройки сохранены, прокси перезапущен':'Настройки сохранены',true);setTimeout(()=>{loadTelegram();loadLogs()},600);}
+  else toast(r.error||'ошибка',false);
+}
+
+/* ─────────── модули ─────────── */
+async function doStart(p){
+  const r=await api('start?plugin='+encodeURIComponent(p));
+  if(r.ok)toast(p+': started',true);else toast(r.error||'failed',false);
+  setTimeout(()=>{loadStatus();loadLogs()},700);
+}
+async function doStop(p){await api('stop?plugin='+encodeURIComponent(p));toast(p+': stopped',true);setTimeout(()=>{loadStatus();loadStatus()},400)}
+async function stopAll(){await api('stopall');toast('All stopped',true);statusData={proxy:false,plugins:[]};renderTable();setTimeout(loadStatus,600)}
+async function doRebuild(p){toast('Rebuilding '+p+'...',true);const r=await api('rebuild?plugin='+encodeURIComponent(p));toast(p+': '+(r.ok?'rebuilt':'fail'),r.ok);setTimeout(()=>{loadLogs();loadStatus()},700)}
+async function flushIptables(){await api('flush');toast('iptables nat flushed',true);setTimeout(()=>{loadLogs();loadLogTags()},500)}
+async function loadBackup(){const r=await api('backup');toast(r.ok?'Backup created':'Backup failed',r.ok)}
+
+/* ─────────── автообновление ─────────── */
+function scheduleRefresh(){
+  clearInterval(logTimer);
+  if(document.getElementById('logAuto').checked){
+    logTimer=setInterval(()=>{
+      loadStatus();
+      if(activeTab==='logs'){loadLogs();}
+    },8000);
+  }
+}
+
+loadPlugins();loadStatus();loadLogTags();scheduleRefresh();
+</script>
+</body>
+</html>

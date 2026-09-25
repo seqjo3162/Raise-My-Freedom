@@ -1,0 +1,71 @@
+#!/bin/bash
+# cleanup.sh — Удаляет ТОЛЬКО то, что создал minizapret
+#
+# Удаляются родные цепочки проекта (*_BYPASS, MINIZAPRET_DNS) и jumps на них
+# из цепочки OUTPUT. Цепочки OUTPUT в nat/mangle/raw/filter НЕ флашатся —
+# посторонние правила (docker, minizapret-socks, tproxy и т.п.) остаются.
+# Список цепочек взят из webui/server.c (обработчик /api/flush) и install-bypass.sh.
+
+set -u
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="$ROOT_DIR/logs"
+
+CHAINS=(
+    GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS
+    XCOM_BYPASS SPEEDTEST_BYPASS ACTIVISION_BYPASS
+    BATTLENET_BYPASS ELECTRONICARTS_BYPASS EPICGAMES_BYPASS
+    ROBLOX_BYPASS SOUNDCLOUD_BYPASS STEAM_BYPASS
+    TWITCH_BYPASS MINIZAPRET_DNS
+)
+
+TABLES=(nat mangle filter raw)
+
+if [ "$EUID" -ne 0 ]; then
+    echo "❌ Нужен root: sudo $0"
+    exit 1
+fi
+
+if pgrep -x minizapret >/dev/null 2>&1 || pgrep -x minizapret-web >/dev/null 2>&1; then
+    echo "⚠️  minizapret ещё работает — он пересоздаст цепочки сразу после очистки."
+    echo "   Остановить:  sudo pkill -TERM -x minizapret && sudo pkill -TERM -x minizapret-web"
+    echo ""
+fi
+
+mkdir -p "$LOG_DIR"
+SNAPSHOT="$LOG_DIR/iptables-before-cleanup.rules"
+iptables-save > "$SNAPSHOT" 2>/dev/null && echo "📄 Снапшот правил сохранён: $SNAPSHOT"
+
+removed=0
+for table in "${TABLES[@]}"; do
+    iptables -t "$table" -S OUTPUT >/dev/null 2>&1 || continue
+    for chain in "${CHAINS[@]}"; do
+        iptables -t "$table" -S "$chain" >/dev/null 2>&1 || continue
+        while iptables -t "$table" -C OUTPUT -j "$chain" >/dev/null 2>&1; do
+            iptables -t "$table" -D OUTPUT -j "$chain" >/dev/null 2>&1 || break
+        done
+        iptables -t "$table" -F "$chain" >/dev/null 2>&1
+        if iptables -t "$table" -X "$chain" >/dev/null 2>&1; then
+            echo "  ✓ удалена [$table] $chain"
+            removed=$((removed + 1))
+        fi
+    done
+done
+
+echo ""
+if [ "$removed" -eq 0 ]; then
+    echo "ℹ️  Цепочек minizapret не найдено — ничего не менялось."
+else
+    echo "✅ Удалено цепочек: $removed (посторонние правила не тронуты)"
+fi
+
+current_dns=$(resolvectl dns "$(ip route show default | awk '{print $5; exit}')" 2>/dev/null | tr '\n' ' ')
+echo ""
+echo "DNS на интерфейсе: ${current_dns:-не задан}"
+case "$current_dns" in
+    *127.0.0.1*)
+        echo "⚠️  DNS указывает на 127.0.0.1, а minizapret больше не запущен."
+        echo "   Вернуть публичные:  sudo resolvectl dns $(ip route show default | awk '{print $5; exit}') 8.8.8.8 1.1.1.1"
+        ;;
+esac

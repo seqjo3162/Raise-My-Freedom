@@ -1,0 +1,7 @@
+build/
+build.deploy/
+backups/
+logs/
+*.log
+*.rules
+*.pid
