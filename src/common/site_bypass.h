@@ -1,5 +1,5 @@
-#ifndef MINIZAPRET_SITE_BYPASS_H
-#define MINIZAPRET_SITE_BYPASS_H
+#ifndef RMF_SITE_BYPASS_H
+#define RMF_SITE_BYPASS_H
 
 #include <stdbool.h>
 #include <stddef.h>

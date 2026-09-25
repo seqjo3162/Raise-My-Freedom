@@ -262,7 +262,7 @@ int main(int argc, char **argv) {
             "GOOGLE_YT_BYPASS",
             "XCOM_BYPASS",
             "SPEEDTEST_BYPASS",
-            "MINIZAPRET_DNS",
+            "RMF_DNS",
             "ACTIVISION_BYPASS",
             "BATTLENET_BYPASS",
             "ELECTRONICARTS_BYPASS",
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
 
 usage:
     fprintf(stderr,
-        "minizapret — DNS bypass for blocked services (plugin system)\n\n"
+        "rmf — DNS bypass for blocked services (plugin system)\n\n"
         "Usage:\n"
         "  %s inject --<plugin>   Load plugin and start DNS bypass\n"
         "  %s list                List available plugins\n"

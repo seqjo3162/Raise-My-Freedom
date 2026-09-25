@@ -1,9 +1,9 @@
 #!/bin/bash
-# minizapret Start Script — Plugin Architecture v3.0
+# rmf Start Script — Plugin Architecture v3.0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$ROOT_DIR/build/bin/minizapret"
+BIN="$ROOT_DIR/build/bin/rmf"
 PLUGS_DIR="$ROOT_DIR/build/bin/plugs"
 PLUGIN="${1:-discord}"
 
@@ -15,14 +15,14 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "       🚀 minizapret (plugin system)"
+echo "       🚀 rmf (plugin system)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
 # Проверка прав
 echo -e "${YELLOW}[CHECK] ${NC}Проверка прав запуска..."
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}⚠️  minizapret требует sudo для bind порта 53!${NC}"
+    echo -e "${RED}⚠️  rmf требует sudo для bind порта 53!${NC}"
     echo -e "${RED}Пожалуйста, запустите через: sudo $0${NC}"
     exit 1
 fi
@@ -57,32 +57,32 @@ echo -e "${GREEN}✅ Плагин найден: ${PLUGIN}.xo${NC}"
 
 # Запуск
 echo ""
-echo -e "${YELLOW}[START] ${NC}Запуск minizapret (plugin: ${PLUGIN})..."
+echo -e "${YELLOW}[START] ${NC}Запуск rmf (plugin: ${PLUGIN})..."
 
-nohup "$BIN" inject --"$PLUGIN" > "$ROOT_DIR/logs/minizapret.log" 2>&1 &
-MINIZAPRET_PID=$!
+nohup "$BIN" inject --"$PLUGIN" > "$ROOT_DIR/logs/rmf.log" 2>&1 &
+RMF_PID=$!
 
 echo ""
-echo -e "${GREEN}✅ minizapret запущен!${NC}"
-echo -e "    PID: ${GREEN}${MINIZAPRET_PID}${NC}"
+echo -e "${GREEN}✅ rmf запущен!${NC}"
+echo -e "    PID: ${GREEN}${RMF_PID}${NC}"
 echo -e "    Plugin: ${GREEN}${PLUGIN}${NC}"
 echo -e "    Порт DNS: ${GREEN}127.0.0.1:53${NC}"
 echo ""
 
 sleep 2
 
-if ps -p $MINIZAPRET_PID > /dev/null; then
-    echo -e "${GREEN}✅ minizapret активно (PID: $MINIZAPRET_PID)${NC}"
+if ps -p $RMF_PID > /dev/null; then
+    echo -e "${GREEN}✅ rmf активно (PID: $RMF_PID)${NC}"
 else
-    echo -e "${RED}❌ minizapret не запустился! Проверьте logs/minizapret.log${NC}"
+    echo -e "${RED}❌ rmf не запустился! Проверьте logs/rmf.log${NC}"
     echo ""
-    tail -20 "$ROOT_DIR/logs/minizapret.log" 2>/dev/null
+    tail -20 "$ROOT_DIR/logs/rmf.log" 2>/dev/null
     exit 1
 fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${GREEN}🎉 minizapret запущен!${NC}"
+echo -e "${GREEN}🎉 rmf запущен!${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "📌 Команды управления:"
@@ -93,24 +93,24 @@ echo ""
 echo -e "  ${GREEN}sudo $BIN list${NC}"
 echo -e "      (Список плагинов)"
 echo ""
-echo -e "  ${YELLOW}sudo kill $MINIZAPRET_PID${NC}"
+echo -e "  ${YELLOW}sudo kill $RMF_PID${NC}"
 echo -e "      (Остановить)"
 echo ""
-echo -e "  ${YELLOW}$ROOT_DIR/logs/minizapret.log${NC}  (Лог)"
+echo -e "  ${YELLOW}$ROOT_DIR/logs/rmf.log${NC}  (Лог)"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-echo $MINIZAPRET_PID > "$ROOT_DIR/logs/minizapret.pid"
+echo $RMF_PID > "$ROOT_DIR/logs/rmf.pid"
 
 stop_all() {
     echo ""
     echo -e "${YELLOW}Остановка...${NC}"
-    kill $MINIZAPRET_PID 2>/dev/null || true
-    pkill -TERM -x minizapret 2>/dev/null || true
+    kill $RMF_PID 2>/dev/null || true
+    pkill -TERM -x rmf 2>/dev/null || true
     sleep 1
-    pkill -KILL -x minizapret 2>/dev/null || true
+    pkill -KILL -x rmf 2>/dev/null || true
 }
 trap stop_all SIGINT SIGTERM SIGHUP
 
 echo -e "${GREEN}[INFO] Можно закрыть терминал!${NC}"
-wait $MINIZAPRET_PID 2>/dev/null
+wait $RMF_PID 2>/dev/null

@@ -14,7 +14,8 @@
 #include "src/common/site_bypass.h"
 
 #define MAX_DOMAINS 64
-#define SPEC_PATH_ENV "MINIZAPRET_SPEC"
+#define SPEC_PATH_ENV "RMF_SPEC"
+#define SPEC_PATH_ENV_LEGACY "MINIZAPRET_SPEC"
 #define SPEC_DEFAULT "webui/custom/active.json"
 
 static char g_name[64] = "custom";
@@ -79,6 +80,7 @@ static void jdomains(const char *json) {
 
 static bool load_spec(void) {
     const char *path = getenv(SPEC_PATH_ENV);
+    if (!path || !*path) path = getenv(SPEC_PATH_ENV_LEGACY);
     if (!path || !*path) path = SPEC_DEFAULT;
     FILE *f = fopen(path, "r");
     if (!f) {

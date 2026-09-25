@@ -54,7 +54,7 @@ sudo ./scripts/install-bypass.sh
 
 - переключает DNS интерфейса на `127.0.0.1` (`resolvectl dns`);
 - добавляет цепочки в таблицу `nat` и вешает их на `OUTPUT`;
-- убивает уже запущенные `minizapret` и `minizapret-web`.
+- убивает уже запущенные `rmf` и `rmf-web`.
 
 Откатить всё:
 
@@ -79,12 +79,24 @@ sudo resolvectl dns enp42s0 8.8.8.8 1.1.1.1
 Из консоли:
 
 ```bash
-sudo build/bin/minizapret list                    # что собрано
-sudo build/bin/minizapret inject --discord        # включить обход для одного сервиса
+sudo build/bin/rmf list                    # что собрано
+sudo build/bin/rmf inject --discord        # включить обход для одного сервиса
 ```
 
 `inject` работает, пока живёт процесс: он держит форвардер и релей, убьёшь — правила
 снимутся при выходе. Постоянно — через веб или свой unit.
+
+### Скрипты
+
+```bash
+sudo ./scripts/install-bypass.sh   # установка: сборка, веб, четыре плагина
+sudo ./scripts/cleanup.sh          # снять наши правила, снапшот в logs/
+sudo ./scripts/start-rmf.sh        # один плагин в консоли, по умолчанию discord
+./scripts/test_bypass.sh           # замерить скорость через обход
+```
+
+Веб можно поднять на другом порту: `RMF_PORT=18080 ./build/bin/rmf-web`.
+Корень проекта он берёт из `RMF_ROOT`, а если её нет — из расположения бинарника.
 
 ---
 
@@ -104,7 +116,7 @@ curl -sH "accept: application/dns-json" \
 модуля всё ещё мусор — сбрось кеш резолвера: `sudo resolvectl flush-caches`.
 
 **Порт занят.** Веб сидит на 8080. Проверь: `ss -tlnp | grep 8080`. Занят — поменяй
-через переменную окружения `MINIZAPRET_PORT` при запуске.
+через переменную окружения `RMF_PORT` при запуске.
 
 **Правила не применились.** `sudo iptables -t nat -S | grep -i bypass` покажет, что
 поставилось. Пусто — не хватило root, в логе модуля будет ошибка.

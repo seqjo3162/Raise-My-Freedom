@@ -22,7 +22,7 @@
 #define LOG_MAX 1000
 #define BUF_SIZE 65536
 #define IO_TIMEOUT_MS 2000
-#define PROXY_BIN "build/bin/minizapret"
+#define PROXY_BIN "build/bin/rmf"
 #define PLUGS_DIR "build/bin/plugs"
 #define BACKUP_DIR "backups"
 
@@ -746,10 +746,10 @@ static int stop_plugin(const char *name) {
     return 0;
 }
 
-static void kill_all_minizapret(void) {
+static void kill_all_rmf(void) {
     pid_t pid = fork();
     if (pid == 0) {
-        execl("/usr/bin/pkill", "pkill", "-TERM", "-x", "minizapret", (char *)NULL);
+        execl("/usr/bin/pkill", "pkill", "-TERM", "-x", "rmf", (char *)NULL);
         _exit(127);
     }
     if (pid > 0) {
@@ -757,7 +757,7 @@ static void kill_all_minizapret(void) {
         usleep(300000);
         pid = fork();
         if (pid == 0) {
-            execl("/usr/bin/pkill", "pkill", "-KILL", "-x", "minizapret", (char *)NULL);
+            execl("/usr/bin/pkill", "pkill", "-KILL", "-x", "rmf", (char *)NULL);
             _exit(127);
         }
         if (pid > 0) waitpid(pid, NULL, 0);
@@ -774,7 +774,7 @@ static int do_backup(void) {
     char dst[256];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    snprintf(dst, sizeof(dst), BACKUP_DIR "/minizapret_%04d%02d%02d_%02d%02d%02d.tar.gz",
+    snprintf(dst, sizeof(dst), BACKUP_DIR "/rmf_%04d%02d%02d_%02d%02d%02d.tar.gz",
         t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "tar czf %s --exclude='%s' --exclude='build' -C . . 2>/dev/null", dst, BACKUP_DIR);
@@ -1001,7 +1001,7 @@ static void handle_request(int fd) {
     } else if (strcmp(path, "/api/stopall") == 0) {
         stop_all_plugins();
         stop_proxy();
-        kill_all_minizapret();
+        kill_all_rmf();
         send_json(fd, "200 OK", "{\"ok\":true}");
     } else if (strncmp(path, "/api/stop", 9) == 0) {
         char plugin[256] = {0};
@@ -1032,17 +1032,17 @@ static void handle_request(int fd) {
         const char *cmd =
             "for ch in GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS XCOM_BYPASS SPEEDTEST_BYPASS "
             "ACTIVISION_BYPASS BATTLENET_BYPASS ELECTRONICARTS_BYPASS EPICGAMES_BYPASS ROBLOX_BYPASS "
-            "SOUNDCLOUD_BYPASS STEAM_BYPASS TWITCH_BYPASS MINIZAPRET_DNS; do "
+            "SOUNDCLOUD_BYPASS STEAM_BYPASS TWITCH_BYPASS RMF_DNS; do "
             "iptables -t nat -D OUTPUT -j \"$ch\" 2>/dev/null; "
             "iptables -t nat -F \"$ch\" 2>/dev/null; "
             "iptables -t nat -X \"$ch\" 2>/dev/null; "
             "done";
         int r = spawn_shell(cmd);
-        log_add("minizapret nat chains flush queued");
+        log_add("rmf nat chains flush queued");
         send_json(fd, "200 OK", r == 0 ? "{\"ok\":true,\"queued\":true}" : "{\"ok\":false}");
     } else if (strcmp(path, "/api/info") == 0) {
         send_json(fd, "200 OK",
-            "{\"name\":\"minizapret\",\"version\":\"3.1\",\"api\":["
+            "{\"name\":\"rmf\",\"version\":\"3.1\",\"api\":["
             "\"GET /api/status\",\"GET /api/plugins\",\"GET /api/logs\","
             "\"POST /api/start?plugin=<name>\",\"POST /api/stop?plugin=<name>\","
             "\"POST /api/stopall\",\"POST /api/backup\","
@@ -1118,7 +1118,8 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    char *project_root = getenv("MINIZAPRET_ROOT");
+    char *project_root = getenv("RMF_ROOT");
+    if (!project_root) project_root = getenv("MINIZAPRET_ROOT");
     if (!project_root) {
         char exe_path[512];
         ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -1137,7 +1138,8 @@ int main(int argc, char *argv[]) {
     }
     if (!project_root) project_root = ".";
     snprintf(g_project_root, sizeof(g_project_root), "%s", project_root);
-    const char *port_value = getenv("MINIZAPRET_PORT");
+    const char *port_value = getenv("RMF_PORT");
+    if (!port_value) port_value = getenv("MINIZAPRET_PORT");
     if (port_value && *port_value) {
         char *end = NULL;
         long parsed = strtol(port_value, &end, 10);
