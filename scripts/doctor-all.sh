@@ -5,9 +5,23 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 API="http://127.0.0.1:8080"
 
+# Без python3 разбор логов молча возвращал пустоту, и колонка «решение»
+# выглядела бы как «всё хорошо» при сломанном выводе.
+if ! command -v python3 >/dev/null; then
+    echo "нужен python3: sudo apt install python3" >&2
+    exit 1
+fi
+if ! curl -fsS -m 5 "$API/api/info" >/dev/null 2>&1; then
+    echo "веб не отвечает на $API — сначала sudo ./run.sh start" >&2
+    exit 1
+fi
+
 # Модули на site_bypass — у них есть решение доктора. У остальных своя логика.
-TEMPLATE="activision battlenet epicgames github google roblox spotify steam twitch vrchat"
-OWN="cloudflaredns discord google telegram vrchat"
+# Списки не пересекаются и вместе покрывают все 17 модулей сборки: раньше
+# google и vrchat попадали в оба, а x, soundcloud, speedtestbyookla и
+# electronicarts не попадали ни в один, и доктор молча их пропускал.
+TEMPLATE="activision battlenet electronicarts epicgames github roblox soundcloud spotify steam twitch"
+OWN="cloudflaredns discord google speedtestbyookla telegram vrchat x"
 
 verdict_of() {  # verdict_of <метка>
   local label="$1" out=""
