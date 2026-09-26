@@ -119,7 +119,7 @@ static void secret_set_hex(const char *hex) {
           memcpy(b, env, 32); b[32] = 0;
           secret_set_hex(b);
       } else {
-          secret_set_hex("00000000000000000000000000000000");
+          secret_set_hex("00112233445566778899aabbccddeeff");
       }
   }
 

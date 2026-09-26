@@ -2,6 +2,7 @@
 #include "src/dns/dns_resolve.h"
 #include "src/dns/doh_resolve.h"
 #include "src/common/sni_relay.h"
+#include "src/common/site_probe.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -48,10 +49,15 @@ static const pin_t youtube_pins[] = {
     {NULL, NULL}
 };
 
+// Без s.youtube.com (скрипты и плеер) и youtubei.googleapis.com (API плеера)
+// страница открывается, но видео не грузится, а YouTube показывает «нет
+// подключения к интернету»: эти домены не проходили ни DNS-правило, ни редирект.
 static const char *google_dns_domains[] = {
     "www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be",
     "ytimg.com", "i.ytimg.com", "s.ytimg.com",
     "googlevideo.com", "yt3.ggpht.com",
+    "s.youtube.com", "youtubei.googleapis.com",
+    "www.youtube-nocookie.com", "music.youtube.com",
     "google.com", "www.google.com",
     NULL
 };
@@ -103,9 +109,42 @@ static void wire_pattern(const char *domain, char *out, size_t out_sz) {
     out[o] = '\0';
 }
 
+
+// Google отдаёт новый адрес на каждый запрос: пять DNS-ответов подряд на
+// s.youtube.com дали пять разных адресов. Редирект на один /32 поэтому
+// бесполезен — почти все соединения уходят без обхода. Закрываем диапазоны,
+// из которых Google раздаёт страницы, скрипты и видеопоток.
+// Диапазоны, с которых Google раздаёт страницы, скрипты и видеопоток.
+// 89.113.0.0/16 и 89.108.0.0/16 добавлены по факту: имена вида
+// r1---sn-*.googlevideo.com из сессии плеча уходили на 89.113.122.140, он не
+// попадал ни в один диапазон, и видео давало таймаут.
+static const char *const google_networks[] = {
+    "142.250.0.0/16", "142.251.0.0/16", "172.217.0.0/16", "216.239.0.0/16",
+    "64.233.0.0/16",  "192.178.0.0/16", "209.85.0.0/16", "173.194.0.0/16",
+    "74.125.0.0/16",  "89.113.0.0/16",  "89.108.0.0/16",
+    NULL
+};
+
+static void iptables_add_net_redirect(const char *net) {
+    if (!is_root()) return;
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "iptables -t nat -C GOOGLE_YT_BYPASS -p tcp -d %s --dport 443 "
+        "-j REDIRECT --to-ports %d 2>/dev/null || "
+        "iptables -t nat -A GOOGLE_YT_BYPASS -p tcp -d %s --dport 443 "
+        "-j REDIRECT --to-ports %d",
+        net, GOOGLE_RELAY_PORT, net, GOOGLE_RELAY_PORT);
+    sh(cmd);
+}
+
 static void iptables_base(void) {
     if (!is_root()) return;
     sh("iptables -t nat -N GOOGLE_YT_BYPASS 2>/dev/null || true");
+    // Цепочку очищаем перед сборкой: правила накапливаются между запусками, и
+    // старое правило, стоящее раньше новых, продолжает срабатывать. Так уже
+    // оставались DNAT-правила от прежних версий модуля, и трафик уходил мимо
+    // реля — youtubei.googleapis.com не доходил до обхода.
+    sh("iptables -t nat -F GOOGLE_YT_BYPASS 2>/dev/null || true");
     sh("iptables -t nat -C GOOGLE_YT_BYPASS -m mark --mark 0x4d50/0xfff0 -j RETURN "
        "2>/dev/null || iptables -t nat -I GOOGLE_YT_BYPASS 1 -m mark --mark 0x4d50/0xfff0 -j RETURN");
     sh("iptables -t nat -C GOOGLE_YT_BYPASS -m mark --mark 0x4d5c -j RETURN "
@@ -119,6 +158,7 @@ static void iptables_base(void) {
        "iptables -I OUTPUT -p udp --dport 443 -d 216.239.0.0/16 -j DROP");
     sh("iptables -t nat -D OUTPUT -j GOOGLE_YT_BYPASS 2>/dev/null");
     sh("iptables -t nat -A OUTPUT -j GOOGLE_YT_BYPASS");
+    for (int i = 0; google_networks[i]; i++) iptables_add_net_redirect(google_networks[i]);
 }
 
 static void iptables_add_dns_rule(const char *domain) {
@@ -158,37 +198,55 @@ static void iptables_del_rules(void) {
     sh("iptables -t nat -X GOOGLE_YT_BYPASS 2>/dev/null");
 }
 
+// /etc/hosts важнее нашего DNS, поэтому имена видеопотоков
+// (rr*---sn-*.googlevideo.com) уходят на адреса из hosts, а не на те, что модуль
+// закрыл редиректом. Эти адреса провайдер режет: TLS не проходит. Поэтому
+// читаем hosts и закрываем редиректом те адреса, что там есть.
+static void hosts_redirects(void) {
+    FILE *f = fopen("/etc/hosts", "r");
+    if (!f) return;
+    char line[512], ip[64], names[400];
+    int added = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        if (sscanf(line, "%63s %399[^\n]", ip, names) != 2) continue;
+        if (strncmp(ip, "127.", 4) == 0 || strncmp(ip, "0.", 2) == 0) continue;
+        if (!strstr(names, "googlevideo") && !strstr(names, "ytimg") &&
+            !strstr(names, "ggpht") && !strstr(names, "youtube")) continue;
+        iptables_add_redirect(ip);
+        added++;
+    }
+    fclose(f);
+    printf("[GOOGLE]   видеоадресов из /etc/hosts закрыто: %d\n", added);
+}
+
+// Выбор адресов под обход.
+//
+// Раньше здесь стояла проверка каждого адреса зондом и подстановка «мёртвого»
+// адреса через DNAT на заведомо рабочий. Это оказалось вредным: под нагрузкой
+// зонд не успевает и объявляет живые адреса мёртвыми, после чего весь трафик
+// уводится на чужой адрес и YouTube перестаёт открываться вовсе. Проверка
+// адресов у Google бессмысленна и без неё: DNS отдаёт новый адрес на каждый
+// запрос, поэтому редирект ставится на диапазоны (см. google_networks), а
+// сюда остаётся только разрешение и прибивка hosts-адресов.
 static void resolve_and_redirect(void) {
-    char seen[32][64];
-    int nseen = 0;
+    char ip[64] = {0};
 
     for (int i = 0; google_dns_domains[i]; i++) {
-        char ip[64] = {0};
         if (doh_resolve_a(google_dns_domains[i], ip, sizeof(ip)) != 0) {
             if (dns_resolve_udp(ctx.primary, google_dns_domains[i], ip, sizeof(ip)) != 0)
                 dns_resolve_udp(ctx.fallback, google_dns_domains[i], ip, sizeof(ip));
         }
         if (ip[0]) {
-            int dup = 0;
-            for (int j = 0; j < nseen; j++) dup |= (strcmp(seen[j], ip) == 0);
-            if (!dup && nseen < 32) {
-                snprintf(seen[nseen], sizeof(seen[0]), "%s", ip);
-                printf("[GOOGLE]   %s -> %s\n", google_dns_domains[i], ip);
-                nseen++;
-            }
+            iptables_add_redirect(ip);
+            printf("[GOOGLE]   %s -> %s\n", google_dns_domains[i], ip);
         } else {
             printf("[GOOGLE]   %s -> DNS FAIL\n", google_dns_domains[i]);
         }
     }
-    for (int i = 0; youtube_pins[i].domain; i++) {
-        int dup = 0;
-        for (int j = 0; j < nseen; j++) dup |= (strcmp(seen[j], youtube_pins[i].ip) == 0);
-        if (!dup && nseen < 32) {
-            snprintf(seen[nseen], sizeof(seen[0]), "%s", youtube_pins[i].ip);
-            nseen++;
-        }
-    }
-    for (int i = 0; i < nseen; i++) iptables_add_redirect(seen[i]);
+
+    for (int i = 0; youtube_pins[i].domain; i++) iptables_add_redirect(youtube_pins[i].ip);
+    hosts_redirects();
 }
 
 void google_module_init(google_config_t *config) {
@@ -225,8 +283,11 @@ void google_module_inject(int fd) {
     printf("[GOOGLE] inject: YouTube SNI-split + DoH pins...\n");
     iptables_base();
     for (int i = 0; google_dns_domains[i]; i++) iptables_add_dns_rule(google_dns_domains[i]);
-    resolve_and_redirect();
 
+    // Рель поднимаем ДО проверки адресов. Проверка идёт тем же путём, что и
+    // реальный трафик, то есть через редирект на рель; если рель ещё не
+    // запущен, все адреса получают отказ, модуль concludes «живых нет» и не
+    // доходит до старта реля — YouTube остаётся без обхода.
     sni_relay_config_t rc = {
         .port = GOOGLE_RELAY_PORT,
         .so_mark = GOOGLE_SO_MARK,
@@ -234,6 +295,7 @@ void google_module_inject(int fd) {
         .frag_first_seg = 20,
         .primary_dns = ctx.primary,
         .fallback_dns = ctx.fallback,
+        .no_split_handshake_records = 1,
     };
     if (sni_relay_start(&rc) != 0) {
         fprintf(stderr, "[GOOGLE] relay start failed: %s\n", strerror(errno));
@@ -243,6 +305,8 @@ void google_module_inject(int fd) {
     }
     printf("[GOOGLE]   SNI-split relay: 127.0.0.1:%d (pid %d)\n",
            GOOGLE_RELAY_PORT, sni_relay_pid());
+
+    resolve_and_redirect();
 
     ctx.mode = 1;
     printf("[GOOGLE] inject done (%s)\n",

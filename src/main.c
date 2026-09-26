@@ -197,6 +197,12 @@ static void list_plugins(void) {
 }
 
 int main(int argc, char **argv) {
+    // Модули печатают в stdout через printf. Если вывод не терминал (файл или
+    // пайп от веб-интерфейса), stdout полностью буферизуется и сообщения
+    // модулей выходят только при выходе — после строк самого ядра. Построчная
+    // буферизация возвращает их в лог сразу и в правильном порядке.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
@@ -257,21 +263,15 @@ int main(int argc, char **argv) {
         while (*mod == '-') mod++;
 
         const char *old_chains[] = {
-            "GITHUB_BYPASS", "DISCORD_BYPASS",
-            "VRCHAT_BYPASS",
-            "GOOGLE_YT_BYPASS",
-            "XCOM_BYPASS",
-            "SPEEDTEST_BYPASS",
-            "RMF_DNS",
-            "ACTIVISION_BYPASS",
-            "BATTLENET_BYPASS",
-            "ELECTRONICARTS_BYPASS",
-            "EPICGAMES_BYPASS",
-            "ROBLOX_BYPASS",
-            "SOUNDCLOUD_BYPASS",
-            "STEAM_BYPASS",
-            "TWITCH_BYPASS",
-            NULL
+            "GITHUB_BYPASS", "DISCORD_BYPASS", "VRCHAT_BYPASS", "GOOGLE_YT_BYPASS",
+            "XCOM_BYPASS", "SPEEDTEST_BYPASS", "JINXXY_BYPASS",
+            "RMF_DNS", "NINEGAG_BYPASS", "INSTAGRAM_BYPASS",
+            "MYJELLYFIN_BYPASS", "NETFLIX_BYPASS", "REDDIT_BYPASS",
+            "SPOTIFY_BYPASS", "TIKTOK_BYPASS", "TWITCH_BYPASS",
+            "VK_BYPASS", "XVIDEOS_BYPASS", "YEPEDIA_BYPASS",
+            "ACTIVISION_BYPASS", "BATTLENET_BYPASS", "ELECTRONICARTS_BYPASS",
+            "EPICGAMES_BYPASS", "ROBLOX_BYPASS", "SOUNDCLOUD_BYPASS",
+            "STEAM_BYPASS", NULL
         };
         for (int i = 0; old_chains[i]; i++) {
             char command[256];
