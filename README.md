@@ -37,8 +37,9 @@ nfqws). Здесь всё переделано в модульную систе�
 
 Копируй три строки и вставляй в терминал. Нужен root.
 
-Нужны `curl`, `iptables`, `python3` и `resolvectl` — на Pop!_OS и Ubuntu они уже
-есть. На минимальной системе доустанови: `sudo apt install curl iptables python3 systemd-resolved`.
+Нужны `curl`, `iptables` и `resolvectl` — на Pop!_OS и Ubuntu они уже есть. На
+минимальной системе доустанови: `sudo apt install curl iptables systemd-resolved`.
+Ничего кроме этого не требуется: проект на чистом C, интерпретаторы не нужны.
 
 ```bash
 git clone https://github.com/seqjo3162/Raise-My-Freedom.git

@@ -565,6 +565,47 @@ static void send_response(int fd, const char *status, const char *ct, const char
     (void)send_all(fd, body, blen);
 }
 
+// Вердикт доктора для метки вида GITHUB: берём из кольца логов строку,
+// где модуль сообщил своё решение. Раньше это разбирал python в
+// scripts/doctor-all.sh — парсить JSON в shell пришлось бы заново в каждом
+// скрипте, а решение всё равно принимает логика модуля.
+static void doctor_verdict(const char *label, char *out, size_t out_size) {
+    static const char *const keys[] = {
+        "проверка SNI", "домен ", "адрес выброшен", "недоступен", NULL
+    };
+    char needle[128];
+    snprintf(needle, sizeof(needle), "[%s]", label);
+    out[0] = '\0';
+    int n = log_ring.count < LOG_MAX ? log_ring.count : LOG_MAX;
+    int start = (log_ring.count < LOG_MAX) ? 0 : log_ring.head;
+    for (int i = 0; i < n; i++) {
+        const char *line = log_ring.lines[(start + i) % LOG_MAX];
+        if (!strstr(line, needle)) continue;
+        int hit = 0;
+        for (const char *const *k = keys; *k && !hit; k++)
+            if (strstr(line, *k)) hit = 1;
+        if (!hit) continue;
+        const char *tail = strchr(line, ']');
+        snprintf(out, out_size, "%s", tail && tail[1] ? tail + 1 : line);
+        char *nl = strpbrk(out, "\r\n");
+        if (nl) *nl = '\0';
+        char *p = out;
+        while (*p == ' ') p++;
+        if (p != out) memmove(out, p, strlen(p) + 1);
+        return;
+    }
+}
+
+static void send_text(int fd, const char *status, const char *text) {
+    char head[256];
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                     "Content-Length: %zu\r\nConnection: close\r\n\r\n", status, strlen(text));
+    if (n > 0) { ssize_t w = write(fd, head, (size_t)n); (void)w; }
+    ssize_t w = write(fd, text, strlen(text));
+    (void)w;
+}
+
 static void send_json(int fd, const char *status, const char *json) {
     send_response(fd, status, "application/json", json);
 }
@@ -1056,6 +1097,22 @@ static void handle_request(int fd) {
         char json[16384];
         get_status_json(json, sizeof(json));
         send_json(fd, "200 OK", json);
+    } else if (strncmp(path, "/api/verdict", 12) == 0) {
+        // Решение доктора по одному модулю обычным текстом: для скриптов,
+        // которым не нужен разбор JSON.
+        char label[64] = {0}, verdict[256] = {0};
+        const char *qp = strstr(path, "?plugin=");
+        if (qp) {
+            const char *end = strchr(qp + 8, '&');
+            size_t len = end ? (size_t)(end - (qp + 8)) : strlen(qp + 8);
+            if (len >= sizeof(label)) len = sizeof(label) - 1;
+            memcpy(label, qp + 8, len);
+            label[len] = '\0';
+        }
+        for (char *q = label; *q; q++) *q = (char)toupper((unsigned char)*q);
+        if (!label[0]) { send_text(fd, "400 Bad Request", "нужен ?plugin=\n"); return; }
+        doctor_verdict(label, verdict, sizeof(verdict));
+        send_text(fd, "200 OK", verdict[0] ? verdict : "решения пока нет\n");
     } else if (strncmp(path, "/api/logs", 9) == 0) {
         char json[LOG_MAX * 520 + 16];
         char tag[128] = {0}, q[256] = {0};
@@ -1270,7 +1327,8 @@ static void handle_request(int fd) {
             "\"POST /api/start?plugin=<name>\",\"POST /api/stop?plugin=<name>\","
             "\"POST /api/stopall\",\"POST /api/backup\",\"POST /api/save\","
             "\"POST /api/rebuild?plugin=<name>\",\"POST /api/rebuild\",\"POST /api/flush\","
-            "\"POST /api/restart?target=web|proxy|all\",\"GET /api/info\"]}");
+            "\"POST /api/restart?target=web|proxy|all\","
+            "\"GET /api/verdict?plugin=\",\"GET /api/info\"]}");
     } else if (strncmp(path, "/api/restart", 12) == 0) {
         char target[64] = {0};
         const char *qp = strstr(path, "?target=");
