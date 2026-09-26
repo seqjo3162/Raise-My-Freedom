@@ -235,6 +235,16 @@ const BYPASS = {
   electronicarts:'',soundcloud:'',speedtestbyookla:''
 };
 
+// Отображаемые имена модулей. Без этой карты renderTable падал с
+// ReferenceError, и список оставался пустым без всякой ошибки на экране.
+const NAMES = {
+  activision:'Activision', battlenet:'Battlenet', cloudflaredns:'Cloudflare DNS',
+  discord:'Discord', electronicarts:'EA App', epicgames:'Epic Games',
+  github:'GitHub', google:'Google', roblox:'Roblox', soundcloud:'SoundCloud',
+  speedtestbyookla:'Speedtest', spotify:'Spotify', steam:'Steam',
+  telegram:'Telegram', twitch:'Twitch', vrchat:'VRChat', x:'X.com'
+};
+
 let allPlugins=[], statusData={proxy:false,plugins:[]};
 let activeTab='modules', logTimer=null, lastLogSig='';
 
