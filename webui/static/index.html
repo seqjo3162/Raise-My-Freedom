@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Raise-My-Freedom</title>
+<title>rmf</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;display:flex;justify-content:center;padding:24px}
@@ -66,7 +66,7 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
 </head>
 <body>
 <div class="container">
-<h1>Raise-My-Freedom</h1>
+<h1>rmf</h1>
 
 <div class="tabs">
   <div class="tab on" data-tab="modules" onclick="switchTab('modules')">Модули</div>
@@ -82,6 +82,8 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
       <button class="btn btn-dim" onclick="loadPlugins()">Refresh list</button>
       <button class="btn btn-danger" onclick="flushIptables()">Flush iptables</button>
       <button class="btn btn-dim" onclick="stopAll()">Stop all</button>
+      <button class="btn btn-dim" onclick="doSave()" title="Снимок состояния в cache/save">Сохранить</button>
+      <button class="btn btn-go" onclick="restartAll()" title="Остановить всё, пересобрать проект и запустить заново">Пересобрать и перезапустить</button>
       <button class="btn btn-dim" onclick="loadBackup()">Backup</button>
     </div>
   </div>
@@ -99,7 +101,7 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
       <label>Секрет (32 hex)</label>
       <div>
         <div style="display:flex;gap:8px;align-items:center">
-          <input type="text" id="tgSecret" placeholder="00000000000000000000000000000000" spellcheck="false" style="flex:1">
+          <input type="text" id="tgSecret" placeholder="00112233445566778899aabbccddeeff" spellcheck="false" style="flex:1">
           <button class="btn btn-dim" onclick="genTgSecret()" title="Сгенерировать 16 случайных байт">Обновить</button>
           <button class="btn btn-go" onclick="saveTelegram(1)">Применить</button>
         </div>
@@ -117,11 +119,12 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
       </div>
 
       <label>Режим</label>
-      <div class="checkrow">
-        <label class="chk"><input type="checkbox" id="tgTls" checked> fake-TLS</label>
-        <label class="chk"><input type="checkbox" id="tgWs" checked> WebSocket</label>
-        <span class="hint" style="margin:0">WS через kws*.web.telegram.org, иначе TCP к ДЦ</span>
-      </div>
+       <div class="checkrow">
+         <label class="chk"><input type="checkbox" id="tgTls" checked> fake-TLS</label>
+         <label class="chk"><input type="checkbox" id="tgWs" checked> WebSocket</label>
+         <span class="hint" style="margin:0">WS через kws*.web.telegram.org, иначе TCP к ДЦ</span>
+       </div>
+
 
       <label></label>
       <div>
@@ -225,13 +228,11 @@ const BYPASS = {
   discord:'SNI-split relay + DNS pinning',vrchat:'DNS pinning + iptables DNAT',
   telegram:'MTProxy (WebSocket + SNI-fake-TLS)',x:'SNI-split relay + DoH/DNS pinning',
   github:'DoH-резолв против подмены DNS',
-  google:'DNS bypass',twitch:'',spotify:'',steam:'',
-  epicgames:'',roblox:'',soundcloud:'',speedtestbyookla:'',
-  electronicarts:'',battlenet:'',activision:'',cloudflaredns:'',
-  custom:'модуль из конструктора'
-};
-};
-const NAMES = {x:'X',roblox:'Roblox',soundcloud:'SoundCloud',cloudflaredns:'Cloudflare DNS',telegram:'Telegram',custom:'Конструктор'};
+  google:'DNS bypass',
+  twitch:'',spotify:'',
+  steam:'',epicgames:'',roblox:'',cloudflaredns:'',
+  battlenet:'',activision:'',telegram:'',discord:'',github:'',vrchat:''
+
 
 let allPlugins=[], statusData={proxy:false,plugins:[]};
 let activeTab='modules', logTimer=null, lastLogSig='';
@@ -323,7 +324,10 @@ function switchTab(name){
   if(name==='telegram') loadTelegram();
 }
 
-function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(ok?'ok':'err');setTimeout(()=>t.className='toast',2500)}
+window.addEventListener('error',e=>console.error('[rmf] необработанная ошибка:',e.message,e.filename+':'+e.lineno));
+window.addEventListener('unhandledrejection',e=>console.error('[rmf] необработанный отказ промиса:',e.reason));
+
+function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(ok?'ok':'err');setTimeout(()=>t.className='toast',ok?2500:7000)}
 function isRunning(name){return statusData.plugins.some(p=>p.name===name&&p.active)}
 
 function renderTable(){
@@ -347,12 +351,23 @@ function renderTable(){
   });
 }
 
+function rmfErr(where,detail){
+  console.error('[rmf] '+where+': '+detail);
+  return detail;
+}
 async function api(path,opt){
-  try{const r=await fetch('/api/'+path,opt);return await r.json()}catch(e){return{ok:false,error:e.message}}
+  let r;
+  try{r=await fetch('/api/'+path,opt)}
+  catch(e){return{ok:false,error:rmfErr(path+' — запрос не дошёл',e.message)}}
+  let d;
+  try{d=await r.json()}
+  catch(e){return{ok:false,error:rmfErr(path+' — ответ не JSON (HTTP '+r.status+')',e.message)}}
+  if(d&&d.ok===false)rmfErr(path,d.error||'без описания');
+  return d;
 }
 
-async function loadPlugins(){const r=await api('plugins');allPlugins=Array.isArray(r)?r:[];renderTable()}
-async function loadStatus(){const r=await api('status');statusData=r&&r.plugins?r:{proxy:false,plugins:[]};renderTable()}
+async function loadPlugins(){const r=await api('plugins');if(!Array.isArray(r))console.error('[rmf] /api/plugins вернул не список:',r);allPlugins=Array.isArray(r)?r:[];renderTable()}
+async function loadStatus(){const r=await api('status');if(!r||!r.plugins)console.error('[rmf] /api/status недоступен:',r);statusData=r&&r.plugins?r:{proxy:false,plugins:[]};renderTable()}
 
 /* ─────────── Логи с фильтрами ─────────── */
 async function loadLogTags(){
@@ -401,10 +416,11 @@ async function loadTelegram(){
     document.getElementById('tgPort').value=r.port;
     document.getElementById('tgIpv6').checked=!!r.prefer_ipv6;
     document.getElementById('tgX4').checked=true;
-    document.getElementById('tgTls').checked=!!r.fake_tls;
-    document.getElementById('tgWs').checked=!!r.ws;
-    document.getElementById('tgSecret').placeholder='(текущий: '+r.secret+', длина '+r.secret_len+')';
-    document.getElementById('tgStatus').textContent='текущий порт: '+r.port+' · секрет: '+r.secret+' · fake-TLS: '+(r.fake_tls?'вкл':'выкл')+' · WS: '+(r.ws?'вкл':'выкл');
+     document.getElementById('tgTls').checked=!!r.fake_tls;
+     document.getElementById('tgWs').checked=!!r.ws;
+     document.getElementById('tgSecret').placeholder='(текущий: '+r.secret+', длина '+r.secret_len+')';
+     document.getElementById('tgStatus').textContent='текущий порт: '+r.port+' · секрет: '+r.secret+' · fake-TLS: '+(r.fake_tls?'вкл':'выкл')+' · WS: '+(r.ws?'вкл':'выкл');
+
   }
   document.getElementById('tgState').textContent=isRunning('telegram')?'работает':'остановлен';
   document.getElementById('tgState').style.color=isRunning('telegram')?'#3fb950':'#484f58';
@@ -420,9 +436,10 @@ async function saveTelegram(restart){
   const secret=document.getElementById('tgSecret').value.trim();
   const port=document.getElementById('tgPort').value;
   const v6=document.getElementById('tgIpv6').checked?1:0;
-  const tls=document.getElementById('tgTls').checked?1:0;
-  const ws=document.getElementById('tgWs').checked?1:0;
-  let url='telegram?port='+encodeURIComponent(port)+'&prefer_ipv6='+v6+'&fake_tls='+tls+'&ws='+ws+'&start='+(restart?1:0);
+   const tls=document.getElementById('tgTls').checked?1:0;
+   const ws=document.getElementById('tgWs').checked?1:0;
+   let url='telegram?port='+encodeURIComponent(port)+'&prefer_ipv6='+v6+'&fake_tls='+tls+'&ws='+ws+'&start='+(restart?1:0);
+
   if(secret)url+='&secret='+encodeURIComponent(secret);
   const r=await api(url,{method:'POST'});
   if(r.ok){toast(restart?'Настройки сохранены, прокси перезапущен':'Настройки сохранены',true);setTimeout(()=>{loadTelegram();loadLogs()},600);}
@@ -432,14 +449,37 @@ async function saveTelegram(restart){
 /* ─────────── модули ─────────── */
 async function doStart(p){
   const r=await api('start?plugin='+encodeURIComponent(p));
-  if(r.ok)toast(p+': started',true);else toast(r.error||'failed',false);
+  if(r.ok){console.info('[rmf] '+p+': запущен');toast(p+': started',true)}
+  else{console.error('[rmf] '+p+' не запустился —',r.error||'причина не сообщена');
+       toast(p+': '+String(r.error||'failed'),false)}
   setTimeout(()=>{loadStatus();loadLogs()},700);
 }
-async function doStop(p){await api('stop?plugin='+encodeURIComponent(p));toast(p+': stopped',true);setTimeout(()=>{loadStatus();loadStatus()},400)}
-async function stopAll(){await api('stopall');toast('All stopped',true);statusData={proxy:false,plugins:[]};renderTable();setTimeout(loadStatus,600)}
-async function doRebuild(p){toast('Rebuilding '+p+'...',true);const r=await api('rebuild?plugin='+encodeURIComponent(p));toast(p+': '+(r.ok?'rebuilt':'fail'),r.ok);setTimeout(()=>{loadLogs();loadStatus()},700)}
-async function flushIptables(){await api('flush');toast('iptables nat flushed',true);setTimeout(()=>{loadLogs();loadLogTags()},500)}
-async function loadBackup(){const r=await api('backup');toast(r.ok?'Backup created':'Backup failed',r.ok)}
+async function doStop(p){const r=await api('stop?plugin='+encodeURIComponent(p));if(r&&r.ok===false)console.error('[rmf] '+p+' не остановлен —',r.error);toast(p+': stopped',true);setTimeout(()=>{loadStatus();loadStatus()},400)}
+async function stopAll(){const r=await api('stopall');if(r&&r.ok===false)console.error('[rmf] stopall —',r.error);toast('All stopped',true);statusData={proxy:false,plugins:[]};renderTable();setTimeout(loadStatus,600)}
+async function doRebuild(p){toast('Rebuilding '+p+'...',true);const r=await api('rebuild?plugin='+encodeURIComponent(p));if(!r.ok)console.error('[rmf] пересборка '+p+' —',r.error);toast(p+': '+(r.ok?'rebuilt':(r.error||'fail')),r.ok);setTimeout(()=>{loadLogs();loadStatus()},700)}
+async function flushIptables(){const r=await api('flush');if(r&&r.ok===false)console.error('[rmf] flush —',r.error);toast('iptables nat flushed',true);setTimeout(()=>{loadLogs();loadLogTags()},500)}
+// Полный перезапуск: сервер сам выполнит «run.sh stop && run.sh start».
+// Веб уходит на несколько секунд, поэтому ждём его возврата опросом /api/status
+// и только потом перерисовываем страницу.
+async function restartAll(){
+  if(!confirm('Остановить всё, пересобрать проект и запустить заново?'))return;
+  toast('Перезапуск: стоп, сборка, старт...',true);
+  document.body.style.opacity='.45';
+  try{
+    const r=await api('restart?target=all',{method:'POST'});
+    if(r&&r.ok===false)console.error('[rmf] перезапуск —',r.error);
+  }catch(e){console.error('[rmf] перезапуск —',e.message)}
+  let tries=0;
+  const wait=setInterval(async()=>{
+    if(++tries>180){clearInterval(wait);document.body.style.opacity='';toast('Веб не вернулся, посмотри logs/web.log',false);return}
+    try{
+      const res=await fetch('/api/status');
+      if(res.ok){clearInterval(wait);location.reload()}
+    }catch(e){/* веб ещё не поднялся — ждём дальше */}
+  },1500);
+}
+async function doSave(){const r=await api('save',{method:'POST'});if(!r.ok)console.error('[rmf] сейв —',r.error);toast(r.ok?'Сейв в cache/save':(r.error||'сбой сейва'),r.ok)}
+async function loadBackup(){const r=await api('backup');if(!r.ok)console.error('[rmf] backup —',r.error);toast(r.ok?'Backup created':(r.error||'Backup failed'),r.ok)}
 
 /* ─────────── автообновление ─────────── */
 function scheduleRefresh(){

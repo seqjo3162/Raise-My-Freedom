@@ -15,12 +15,19 @@ PLUGS_DIR = $(BUILD_DIR)/bin/plugs
 RMF_BIN = $(BUILD_DIR)/bin/rmf
 WEBUI_BIN = $(BUILD_DIR)/bin/rmf-web
 
-MODULES = activision battlenet cloudflaredns discord electronicarts epicgames github google \
-          roblox soundcloud speedtestbyookla spotify steam telegram twitch vrchat x
+MODULES = activision battlenet cloudflaredns discord electronicarts epicgames \
+          github google roblox soundcloud speedtestbyookla spotify steam \
+          telegram twitch vrchat x
 
-# Источники ядра (sni_relay + doh_resolve — общие для google/x/speedtest)
+# Слой управления перехватом. Ровно один бэкенд на сборку: выбор платформы
+# делает Makefile, а не рантайм. Для Windows заменяется на
+# src/netfilter/netfilter_win.c (WinDivert).
+NETFILTER_SRC = src/netfilter/netfilter_linux.c
+
+# Источники ядра (sni_relay + doh_resolve — общие для модулей на их основе)
 CORE_SRC = src/main.c src/proxy/proxy.c src/dns/dns_resolve.c \
-           src/dns/doh_resolve.c src/common/sni_relay.c
+           src/dns/doh_resolve.c src/common/sni_relay.c $(NETFILTER_SRC)
+
 
 .PHONY: all clean core plugs list webui rebuild
 
@@ -41,6 +48,7 @@ plugs: $(addprefix $(PLUGS_DIR)/,$(addsuffix .xo,$(MODULES)))
 	@echo "  ✅ All plugins built → $(PLUGS_DIR)/"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+
 # ── Шаблон плагина ────────────────────────────────────
 # $(1) = имя плагина
 # $(2) = папка исходников
@@ -57,14 +65,21 @@ $(PLUGS_DIR)/$(1)_entry.c:
 	@echo '#define PLUGIN_STATUS_FN $(3)_get_status' >> $$@
 	@echo '#include "src/plugin_entry.h"' >> $$@
 
-$(PLUGS_DIR)/$(1).xo: $(PLUGS_DIR)/$(1)_entry.c $(filter-out %/test.c, $(wildcard src/modules/$(2)/src/*.c)) $(wildcard src/modules/$(2)/include/*.h) $(EXTRA_SRC_$(1)) src/dns/dns_resolve.c src/dns/doh_resolve.c src/common/sni_relay.c src/common/site_bypass.c src/common/site_bypass.h src/common/sni_relay.h src/common/site_module_impl.h
+# Makefile в зависимостях: иначе после правки рецепта make считает старый
+# .xo актуальным (файл новее изменившегося .c) и молча пропускает перелинковку.
+$(PLUGS_DIR)/$(1).xo: Makefile $(PLUGS_DIR)/$(1)_entry.c $(filter-out %/test.c, $(wildcard src/modules/$(2)/src/*.c)) $(wildcard src/modules/$(2)/include/*.h) $(EXTRA_SRC_$(1)) src/dns/dns_resolve.c src/dns/doh_resolve.c src/common/sni_relay.c src/common/site_bypass.c src/common/site_bypass.h src/common/site_module_impl.h src/netfilter/netfilter.h src/common/plain_relay.c src/common/plain_relay.h
 	@mkdir -p $(PLUGS_DIR)
-	$(CC) -shared -fPIC -I. $(CFLAGS) -o $$@ $(PLUGS_DIR)/$(1)_entry.c $(filter-out %/test.c, $(wildcard src/modules/$(2)/src/*.c)) $(EXTRA_SRC_$(1)) src/dns/dns_resolve.c src/dns/doh_resolve.c src/common/sni_relay.c $(PLUGIN_LIBS_$(1)) src/common/site_bypass.c -lcrypto
+	$(CC) -shared -fPIC -I. $(CFLAGS) -o $$@ $(PLUGS_DIR)/$(1)_entry.c $(filter-out %/test.c, $(wildcard src/modules/$(2)/src/*.c)) $(EXTRA_SRC_$(1)) src/dns/dns_resolve.c src/dns/doh_resolve.c src/common/sni_relay.c $(PLUGIN_LIBS_$(1)) src/common/site_bypass.c src/common/site_probe.c src/common/plain_relay.c $(NETFILTER_SRC) -lssl -lcrypto
 	@echo "  ✅ $(1).xo"
 endef
 
 # ── Генерация правил для каждого плагина ──────────────
-PLUGIN_LIBS_telegram = -lssl -lcrypto -lpthread
+# Общий рель и реестр IP. ВАЖНО: EXTRA_SRC_* должен быть объявлен ДО
+# $(eval $(call PLUGIN_template,...)) — рецепт раскрывается в момент объявления,
+# иначе переменная подставится пустой и плагин не соберётся.
+EXTRA_SRC_vrchat  = src/common/claims.c
+EXTRA_SRC_discord = src/common/claims.c
+
 $(eval $(call PLUGIN_template,activision,activision,activision))
 $(eval $(call PLUGIN_template,battlenet,battlenet,battlenet))
 $(eval $(call PLUGIN_template,cloudflaredns,cloudflayerdnscom,cloudflayerdns))
@@ -78,6 +93,7 @@ $(eval $(call PLUGIN_template,soundcloud,soundcloudcom,soundcloud))
 $(eval $(call PLUGIN_template,speedtestbyookla,speedtestbyookla,speedtestbyookla))
 $(eval $(call PLUGIN_template,spotify,spotify,spotify))
 $(eval $(call PLUGIN_template,steam,steam,steam))
+PLUGIN_LIBS_telegram = -lssl -lcrypto -lpthread
 $(eval $(call PLUGIN_template,telegram,telegram,telegram))
 $(eval $(call PLUGIN_template,twitch,twitch,twitch))
 $(eval $(call PLUGIN_template,vrchat,vrchat,vrchat))
@@ -86,6 +102,11 @@ $(eval $(call PLUGIN_template,x,xcom,xcom))
 # ── List ──────────────────────────────────────────────
 list: core
 	@$(RMF_BIN) list
+
+# Список модулей одним словом в строке. Нужен, чтобы вычищать .xo удалённых
+# модулей: без этого они навсегда остаются в build/bin/plugs и в списке веба.
+list-modules:
+	@echo $(MODULES)
 
 # ── Clean ─────────────────────────────────────────────
 clean:
@@ -101,7 +122,7 @@ rebuild: clean all
 # ── Web UI ─────────────────────────────────────────────
 webui:
 	@mkdir -p $(BUILD_DIR)/bin
-	$(CC) $(CFLAGS) -o $(WEBUI_BIN) $(WEBUI_DIR)/server.c
+	$(CC) $(CFLAGS) -o $(WEBUI_BIN) $(WEBUI_DIR)/server.c $(NETFILTER_SRC)
 	@echo "  ✅ $(WEBUI_BIN)"
 
 # ── Конструктор: валидатор и раннер ────────────────────
@@ -127,12 +148,13 @@ $(PLUGS_DIR)/custom_entry.c:
 # Плагин-раннер: один бинарник запускает любую спецификацию из конструктора
 $(CUSTOM_PLUGIN): $(PLUGS_DIR)/custom_entry.c $(SRC_DIR)/constructor/custom_plugin.c \
 		$(SRC_DIR)/dns/dns_resolve.c $(SRC_DIR)/dns/doh_resolve.c \
-		$(SRC_DIR)/common/sni_relay.c $(SRC_DIR)/common/site_bypass.c
+		$(SRC_DIR)/common/sni_relay.c $(SRC_DIR)/common/site_bypass.c \
+		$(NETFILTER_SRC)
 	@mkdir -p $(PLUGS_DIR)
 	$(CC) -shared -fPIC -I. $(CFLAGS) -o $@ $(PLUGS_DIR)/custom_entry.c \
 		$(SRC_DIR)/constructor/custom_plugin.c $(SRC_DIR)/dns/dns_resolve.c \
 		$(SRC_DIR)/dns/doh_resolve.c $(SRC_DIR)/common/sni_relay.c \
-		$(SRC_DIR)/common/site_bypass.c -lcrypto -lpthread
+		$(SRC_DIR)/common/site_bypass.c $(NETFILTER_SRC) -lcrypto -lpthread
 	@echo "  ✅ custom.xo"
 
 custom: $(CUSTOM_PLUGIN)

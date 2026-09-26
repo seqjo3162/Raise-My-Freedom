@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
 #include "src/common/site_bypass.h"
+#include "src/netfilter/netfilter.h"
 #include "src/dns/dns_resolve.h"
 #include "src/dns/doh_resolve.h"
-#include "src/common/sni_relay.h"
+#include "src/common/plain_relay.h"
+#include "src/common/site_probe.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -12,6 +14,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -22,6 +25,10 @@
 #include <unistd.h>
 
 #define MAX_SITE_DOMAINS 64
+
+// Таймауты пробы: компромисс между точностью и временем старта модуля.
+#define PROBE_TIMEOUT_MS 1000
+#define PROBE_MAX_IPS    3
 #define DNS_READY_TIMEOUT_MS 2000
 
 typedef struct {
@@ -39,10 +46,6 @@ static int site_ip_allowed(const char *ip) {
     struct in_addr parsed;
     if (!ip || inet_pton(AF_INET, ip, &parsed) != 1) return 0;
     return !site_ip_validator || site_ip_validator(ip);
-}
-
-static int run_cmd(const char *cmd) {
-    return system(cmd);
 }
 
 static int valid_token(const char *value) {
@@ -78,88 +81,112 @@ static const char *lookup_pin(const char *domain) {
     return NULL;
 }
 
-static int wire_hex_pattern(const char *domain, char *out, size_t out_size) {
-    if (!domain || !out || out_size == 0) return -1;
-    size_t used = 0;
-    const char *s = domain;
-    while (*s) {
-        const char *dot = strchr(s, '.');
-        size_t len = dot ? (size_t)(dot - s) : strlen(s);
-        if (len == 0 || len > 63) return -1;
-        char label[8];
-        int n = snprintf(label, sizeof(label), "%02X", (unsigned char)len);
-        if (n < 0 || used + (size_t)n >= out_size) return -1;
-        memcpy(out + used, label, (size_t)n);
-        used += (size_t)n;
-        for (size_t i = 0; i < len; i++) {
-            n = snprintf(out + used, out_size - used, "%02X", (unsigned char)s[i]);
-            if (n < 0 || used + (size_t)n >= out_size) return -1;
-            used += (size_t)n;
+
+// «Доктор»: проверяет закреплённые адреса и решает, нужен ли рель.
+//   - адрес, до которого не доходит TCP, выбрасывается: рель не поможет,
+//     он соединяется с того же адреса;
+//   - если хотя бы на один запрос сервер не отвечает, домен режут по имени
+//     и нужен рель с разрывом SNI; если отвечают все — рель не нужен.
+static int site_doctor(const site_bypass_config_t *config) {
+    int kept = 0, silent = 0, tested = 0;
+    // Собираем оставшиеся записи отдельно и переписываем таблицу целиком.
+    // Раньше выброшенные адреса сдвигались на месте со счётчиком, который
+    // уменьшался на КАЖДЫЙ оставленный адрес, — таблица схлопывалась в ноль,
+    // и модуль терял все закрепления: ответчик уходил в апстрим, а REDIRECT
+    // не устанавливался вовсе.
+    site_pin_t kept_pins[MAX_SITE_DOMAINS];
+
+    for (int i = 0; i < site_pin_count; i++) {
+        const char *ip = site_pins[i].ip;
+        if (!site_probe_tcp(ip, 443, PROBE_TIMEOUT_MS)) {
+            printf("[%s] %s -> %s: TCP не доходит, адрес выброшен\n",
+                   config->name, site_pins[i].domain, ip);
+            continue;
         }
-        if (!dot) break;
-        s += len + 1;
+        if (tested < PROBE_MAX_IPS) {
+            // Проверяем дважды: блокировка у провайдера меняется во времени, и по
+            // одной удачной пробе доктор снимал рель у домена, который через
+            // минуту снова оказывался зарезанным. Два подряд «вижу» — верим;
+            // любая тишина — считаем домен режется по имени.
+            int sni1 = site_probe_sni(ip, site_pins[i].domain, PROBE_TIMEOUT_MS);
+            int sni2 = (sni1 == 1)
+                ? site_probe_sni(ip, site_pins[i].domain, PROBE_TIMEOUT_MS) : 0;
+            if (sni1 != 1 || sni2 != 1) silent++;
+            tested++;
+        }
+        if (kept < MAX_SITE_DOMAINS) kept_pins[kept++] = site_pins[i];
     }
-    out[used] = '\0';
-    return (int)used;
+
+    if (kept == 0) {
+        printf("[%s] ни один адрес не отвечает — сайт недоступен из этой сети, "
+               "рель не поможет\n", config->name);
+        return -1;
+    }
+    if (kept != site_pin_count)
+        printf("[%s] закреплений осталось %d из %d\n", config->name, kept, site_pin_count);
+    memcpy(site_pins, kept_pins, sizeof(kept_pins[0]) * (size_t)kept);
+    site_pin_count = kept;
+
+    if (tested == 0)
+        printf("[%s] проверку SNI выполнить не удалось, беру решение по умолчанию\n",
+               config->name);
+    else
+        printf("[%s] проверка SNI: проверено %d, молчат %d\n",
+               config->name, tested, silent);
+
+    if (config->use_relay >= 0) {
+        if (config->use_relay) printf("[%s] рель включён принудительно\n", config->name);
+        return config->use_relay;
+    }
+    if (silent > 0) {
+        printf("[%s] домен режут по имени → нужен рель с разрывом SNI\n", config->name);
+        return 1;
+    }
+    printf("[%s] домен дважды подряд ответил как есть → рель не нужен, "
+           "трафик напрямую\n", config->name);
+    return 0;
 }
 
-static void iptables_add_dns_rule(const site_bypass_state_t *state, const char *domain) {
-    if (getuid() != 0 || !state || !domain) return;
-    char hex[1100], cmd[4096];
-    if (wire_hex_pattern(domain, hex, sizeof(hex)) < 0) return;
-    snprintf(cmd, sizeof(cmd),
-             "iptables -t nat -C %s -p udp --dport 53 -m string --algo bm --hex-string \"%s\" "
-             "-j DNAT --to-destination 127.0.0.1:%d 2>/dev/null || "
-             "iptables -t nat -A %s -p udp --dport 53 -m string --algo bm --hex-string \"%s\" "
-             "-j DNAT --to-destination 127.0.0.1:%d",
-             state->chain, hex, state->dns_port, state->chain, hex, state->dns_port);
-    run_cmd(cmd);
+static void rules_add_dns(const site_bypass_state_t *state, const char *domain) {
+    if (!state || !domain) return;
+    if (nf_dns_redirect(state->chain, domain, state->dns_port) != 0)
+        fprintf(stderr, "[%s] не удалось добавить перехват DNS для %s\n",
+                state->chain, domain);
 }
 
-static void iptables_add_redirect(const site_bypass_state_t *state, const char *ip) {
-    if (getuid() != 0 || !state || !ip) return;
+static void rules_add_redirect(const site_bypass_state_t *state, const char *ip) {
+    if (!state || !ip) return;
     struct in_addr addr;
     if (inet_pton(AF_INET, ip, &addr) != 1) return;
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "iptables -t nat -C %s -p tcp -d %s --dport 443 "
-             "-j REDIRECT --to-ports %d 2>/dev/null || "
-             "iptables -t nat -A %s -p tcp -d %s --dport 443 "
-             "-j REDIRECT --to-ports %d",
-             state->chain, ip, state->relay_port, state->chain, ip, state->relay_port);
-    run_cmd(cmd);
+    nf_tcp_redirect(state->chain, ip, 443, state->relay_port);
 }
 
-static void iptables_install(site_bypass_state_t *state, const site_bypass_config_t *config) {
-    if (getuid() != 0 || !state || !config) return;
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "iptables -t nat -N %s 2>/dev/null || true; "
-             "iptables -t nat -C %s -m mark --mark 0x4d50/0xfff0 -j RETURN 2>/dev/null || "
-             "iptables -t nat -I %s 1 -m mark --mark 0x4d50/0xfff0 -j RETURN; "
-             "iptables -t nat -D OUTPUT -j %s 2>/dev/null || true; "
-             "iptables -t nat -I OUTPUT 1 -j %s",
-             state->chain, state->chain, state->chain, state->chain, state->chain);
-    run_cmd(cmd);
+static void rules_install(site_bypass_state_t *state, const site_bypass_config_t *config,
+                          int use_relay) {
+    if (!state || !config) return;
+    if (nf_chain_create(state->chain) != 0) return;
+    // Сначала исключение собственного трафика, иначе пакеты обхода снова
+    // попадут в цепочку и замкнутся в петлю.
+    nf_exempt_own_traffic(state->chain);
+    nf_hook_output(state->chain, 1);
     for (size_t i = 0; i < config->domain_count; i++) {
         if (!config->domains || !config->domains[i]) continue;
         char domain[256];
         normalize_domain(config->domains[i], domain, sizeof(domain));
-        if (domain[0]) iptables_add_dns_rule(state, domain);
+        if (domain[0]) rules_add_dns(state, domain);
     }
-    for (int i = 0; i < site_pin_count; i++) iptables_add_redirect(state, site_pins[i].ip);
+    // Решение принимает доктор, и оно уже учтено в use_relay. Раньше здесь
+    // проверялось config->use_relay, где для авто-режима стояло -1, и REDIRECT
+    // не ставился вовсе: рель работал, но в него никто не попадал.
+    if (use_relay)
+        for (int i = 0; i < site_pin_count; i++)
+            rules_add_redirect(state, site_pins[i].ip);
     state->rules_installed = true;
 }
 
-static void iptables_remove(site_bypass_state_t *state) {
-    if (getuid() != 0 || !state || !state->chain[0]) return;
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "iptables -t nat -D OUTPUT -j %s 2>/dev/null", state->chain);
-    while (run_cmd(cmd) == 0) {}
-    snprintf(cmd, sizeof(cmd), "iptables -t nat -F %s 2>/dev/null", state->chain);
-    run_cmd(cmd);
-    snprintf(cmd, sizeof(cmd), "iptables -t nat -X %s 2>/dev/null", state->chain);
-    run_cmd(cmd);
+static void rules_remove(site_bypass_state_t *state) {
+    if (!state || !state->chain[0]) return;
+    nf_chain_destroy(state->chain);
     state->rules_installed = false;
 }
 
@@ -255,8 +282,7 @@ static int forward_query(const unsigned char *query, int query_len,
         if (!servers[i] || !servers[i][0]) continue;
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) continue;
-        unsigned int mark = state->mark;
-        setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+        nf_mark_socket_as(fd, (unsigned int)state->mark);
         struct sockaddr_in destination = {0};
         destination.sin_family = AF_INET;
         destination.sin_port = htons(53);
@@ -375,6 +401,62 @@ static void dns_stop(site_bypass_state_t *state) {
     waitpid(pid, NULL, 0);
 }
 
+// Стабильные закрепления.
+//
+// CDN отдают новый адрес на каждый запрос, поэтому после каждого перезапуска
+// модуль выбирал другой, и клиент видел постоянно меняющийся набор серверов —
+// для VRChat это выглядит как подмена трафика. Поэтому прошлый выбор
+// запоминаем и берём снова, пока адрес отвечает; меняем только когда старый
+// перестал работать.
+static site_pin_t prev_pins[MAX_SITE_DOMAINS];
+static int prev_pin_count;
+
+static void pins_path(char *out, size_t cap, const char *name) {
+    snprintf(out, cap, "/run/rmf/pins/%s.pin", name);
+}
+
+static int pins_load(const char *name) {
+    prev_pin_count = 0;
+    if (!name || !name[0]) return 0;
+    char path[512];
+    pins_path(path, sizeof(path), name);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[400];
+    while (prev_pin_count < MAX_SITE_DOMAINS && fgets(line, sizeof(line), f)) {
+        char dom[256], ip[64];
+        if (sscanf(line, "%255s %63s", dom, ip) != 2) continue;
+        snprintf(prev_pins[prev_pin_count].domain,
+                 sizeof(prev_pins[prev_pin_count].domain), "%s", dom);
+        snprintf(prev_pins[prev_pin_count].ip,
+                 sizeof(prev_pins[prev_pin_count].ip), "%s", ip);
+        prev_pin_count++;
+    }
+    fclose(f);
+    return prev_pin_count;
+}
+
+static const char *prev_pin_for(const char *domain) {
+    for (int i = 0; i < prev_pin_count; i++)
+        if (strcasecmp(prev_pins[i].domain, domain) == 0) return prev_pins[i].ip;
+    return NULL;
+}
+
+static void pins_save(const char *name) {
+    if (!name || !name[0] || site_pin_count <= 0) return;
+    mkdir("/run/rmf", 0755);
+    mkdir("/run/rmf/pins", 0755);
+    char path[512], tmp[560];
+    pins_path(path, sizeof(path), name);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < site_pin_count; i++)
+        fprintf(f, "%s %s\n", site_pins[i].domain, site_pins[i].ip);
+    fclose(f);
+    rename(tmp, path);
+}
+
 int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *config) {
     if (!state || !config || !valid_token(config->chain) || !config->domains ||
         config->domain_count == 0 || config->domain_count > MAX_SITE_DOMAINS ||
@@ -392,6 +474,7 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
     state->relay_port = config->relay_port;
     state->mark = config->mark;
     state->dns_fd = -1;
+    pins_load(config->name);
     site_pin_count = 0;
     site_ip_validator = config->validate_ip;
     site_fallback_count = config->fallback_count < 16 ? config->fallback_count : 16;
@@ -403,55 +486,124 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
         char domain[256], ip[64] = {0};
         normalize_domain(config->domains[i], domain, sizeof(domain));
         if (!domain[0]) continue;
-        int resolved = 0;
-        if (doh_resolve_a(domain, ip, sizeof(ip)) == 0 && site_ip_allowed(ip))
-            resolved = 1;
-        if (!resolved && dns_resolve_udp(state->primary, domain, ip, sizeof(ip)) == 0 &&
-            site_ip_allowed(ip))
-            resolved = 1;
-        if (!resolved && dns_resolve_udp(state->fallback, domain, ip, sizeof(ip)) == 0 &&
-            site_ip_allowed(ip))
-            resolved = 1;
-        if (!resolved) ip[0] = '\0';
-        for (size_t j = 0; !site_ip_allowed(ip) && j < site_fallback_count; j++) {
-            if (site_fallback_ips[j] && strlen(site_fallback_ips[j]) < sizeof(ip))
-                snprintf(ip, sizeof(ip), "%s", site_fallback_ips[j]);
+
+        // Точечная прибивка из таблицы модуля: важнее всего прошлого адреса и
+        // разрешения, потому что хосты одного домена могут требовать разных
+        // адресов, а разрешение для них нестабильно.
+        for (size_t k = 0; config->preset_pins && k < config->preset_count; k++) {
+            if (strcasecmp(config->preset_pins[k].domain, domain) != 0) continue;
+            const char *pip = config->preset_pins[k].ip;
+            if (!site_ip_allowed(pip)) {
+                printf("[%s] %s: прибивка %s отклонена проверкой адресов\n",
+                       config->name, domain, pip);
+                break;
+            }
+            snprintf(ip, sizeof(ip), "%s", pip);
+            goto pin_ready;
         }
-        if (!site_ip_allowed(ip)) continue;
+
+        // Прошлый адрес этого домена, если он ещё отвечает, оставляем: так
+        // набор серверов не прыгает при каждом перезапуске модуля.
+        const char *prev = prev_pin_for(domain);
+        if (prev && site_ip_allowed(prev) &&
+            site_probe_tcp(prev, 443, PROBE_TIMEOUT_MS)) {
+            snprintf(ip, sizeof(ip), "%s", prev);
+            goto pin_ready;
+        }
+
+        // Кандидаты: все A-записи от DoH, затем обычный DNS, затем запасные
+        // адреса модуля. Берём первый, до которого доходит TCP: раньше
+        // брался первый попавшийся, и если он недостижим — терялся весь домен.
+        char cands[8][64];
+        int ncand = 0;
+        doh_resolve_a_multi(domain, cands, 8, &ncand);
+        if (ncand == 0) {
+            if (dns_resolve_udp(state->primary, domain, ip, sizeof(ip)) == 0)
+                snprintf(cands[ncand++], 64, "%.*s", 63, ip);
+            else if (dns_resolve_udp(state->fallback, domain, ip, sizeof(ip)) == 0)
+                snprintf(cands[ncand++], 64, "%.*s", 63, ip);
+        }
+        for (size_t j = 0; j < site_fallback_count && ncand < 8; j++)
+            if (site_fallback_ips[j]) snprintf(cands[ncand++], 64, "%.*s", 63, site_fallback_ips[j]);
+
+        ip[0] = '\0';
+        int tried = 0;
+        for (int c = 0; c < ncand; c++) {
+            if (!site_ip_allowed(cands[c])) continue;
+            tried++;
+            if (site_probe_tcp(cands[c], 443, PROBE_TIMEOUT_MS)) {
+                // Ограниченная копия: cands[c] — элемент массива, и без
+                // предела gcc считает источник потенциально выходщим.
+                snprintf(ip, sizeof(ip), "%.*s", (int)sizeof(ip) - 1, cands[c]);
+                break;
+            }
+            if (config->name)
+                printf("[%s] %s: адрес %s недостижим, пробуем следующий\n",
+                       config->name, domain, cands[c]);
+        }
+        if (!site_ip_allowed(ip)) {
+            // Одно сообщение на домен с конкретной причиной: раньше их было
+            // два подряд и оба неверные, из-за чего вывод путался.
+            if (ncand == 0)
+                printf("[%s] %s: не разрешился (нет A-записи через DoH и DNS)\n",
+                       config->name, domain);
+            else if (tried == 0)
+                printf("[%s] %s: ни один адрес не прошёл проверку\n",
+                       config->name, domain);
+            else
+                printf("[%s] %s: все адреса недостижимы с этой сети\n",
+                       config->name, domain);
+        }
+        if (!site_ip_allowed(ip)) continue;   // причина уже напечатана выше
+pin_ready:
         snprintf(site_pins[site_pin_count].domain,
                  sizeof(site_pins[site_pin_count].domain), "%s", domain);
         snprintf(site_pins[site_pin_count].ip,
                  sizeof(site_pins[site_pin_count].ip), "%s", ip);
         site_pin_count++;
     }
-    if (site_pin_count == 0) return -1;
+    pins_save(config->name);
+    if (site_pin_count == 0) {
+        printf("[%s] ни один домен не дал пригодного адреса — обход не запущен\n",
+               config->name);
+        return -1;
+    }
     if (dns_start(state) != 0) return -1;
 
-    iptables_install(state, config);
-    sni_relay_config_t relay = {
+    int use_relay = site_doctor(config);
+    if (use_relay < 0) { site_bypass_stop(state); return -1; }
+
+    rules_install(state, config, use_relay);
+    if (!use_relay) {
+        state->relay_on = false;
+        state->active = true;
+        return 0;
+    }
+    // Именно plain_relay, а не sni_relay: адрес уже проверен доктором, и
+    // sni_relay при недоступном первом кандидате уходил в каскад из DoH и
+    // обычных DNS — тридцать с лишним, а у клиента TLS-таймаут 8-10 с, и
+    // соединение умирало раньше, чем рель успевал подобрать адрес.
+    plain_relay_config_t relay = {
         .port = state->relay_port,
         .so_mark = state->mark,
+        .split_client_hello = 1,
         .frag_delay_ms = 30,
         .frag_first_seg = 20,
-        .primary_dns = state->primary,
-        .fallback_dns = state->fallback,
-        .validate_ip = config->validate_ip,
-        .fallback_ips = config->fallback_ips,
-        .fallback_count = config->fallback_count,
     };
-    if (sni_relay_start(&relay) != 0) {
+    if (plain_relay_start(&relay) != 0) {
         site_bypass_stop(state);
         return -1;
     }
+    state->relay_on = true;
     state->active = true;
     return 0;
 }
 
 void site_bypass_stop(site_bypass_state_t *state) {
     if (!state) return;
-    if (state->rules_installed || state->chain[0]) iptables_remove(state);
+    if (state->rules_installed || state->chain[0]) rules_remove(state);
     dns_stop(state);
-    sni_relay_stop();
+    plain_relay_stop();
     state->active = false;
     state->rules_installed = false;
     state->dns_fd = -1;
@@ -462,5 +614,6 @@ void site_bypass_stop(site_bypass_state_t *state) {
 }
 
 int site_bypass_active(const site_bypass_state_t *state) {
-    return state && state->active && state->dns_pid > 0 && sni_relay_running();
+    if (!state || !state->active || state->dns_pid <= 0) return 0;
+    return state->relay_on ? plain_relay_running() : 1;
 }

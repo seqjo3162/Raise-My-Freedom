@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@ typedef struct {
     char name[128];
     pid_t pid;
     int active;
+    int out_fd;      // stdout/stderr модуля: читаем в лог веба
 } plugin_proc_t;
 
 static plugin_proc_t plugins[MAX_PLUGINS];
@@ -52,6 +54,38 @@ typedef struct {
 static LogRing log_ring = {0};
 
 static char g_project_root[512];
+
+// Сброс кэша systemd-resolved. Нужен после старта модуля с перехватом DNS:
+// иначе клиенты до истечения TTL берут прежний адрес — у huggingface.co он был
+// из отброшенного диапазона, и запрос уходил в никуда, хотя правила стояли.
+static void flush_dns_cache(void) {
+    pid_t p = fork();
+    if (p == 0) {
+        execl("/usr/bin/resolvectl", "resolvectl", "flush-caches", (char *)NULL);
+        _exit(127);
+    }
+    if (p > 0) waitpid(p, NULL, 0);
+}
+
+// Есть ли в кольце лога строка, содержащую подстроку.
+static int log_contains(const char *needle) {
+    if (!needle || !*needle) return 0;
+    int n = log_ring.count < LOG_MAX ? log_ring.count : LOG_MAX;
+    int start = (log_ring.count < LOG_MAX) ? 0 : log_ring.head;
+    for (int i = 0; i < n; i++)
+        if (strstr(log_ring.lines[(start + i) % LOG_MAX], needle)) return 1;
+    return 0;
+}
+
+// Последняя строка лога: туда модуль пишет причину (например, dlopen с
+// undefined symbol). Используется как текст ошибки в ответе API.
+static void log_last_line(char *out, size_t n) {
+    if (n == 0) return;
+    out[0] = 0;
+    if (log_ring.count <= 0) return;
+    int idx = (log_ring.head - 1 + LOG_MAX) % LOG_MAX;
+    snprintf(out, n, "%s", log_ring.lines[idx]);
+}
 
 static void log_add(const char *line) {
     snprintf(log_ring.lines[log_ring.head], 512, "%s", line);
@@ -97,12 +131,11 @@ static void log_read_filtered(const char *tag, const char *q, int limit, char *o
 
 // ─────────── настройки MTProxy для telegram ───────────
 static void send_json(int fd, const char *status, const char *json);
-static int start_plugin(const char *name);
+static int start_plugin(const char *name, char *err, size_t errsz);
 static int stop_plugin(const char *name);
 
 // Конфиг держится рядом с сервером, чтобы его можно было править руками.
-#define TG_CONF_REL "webui/telegram.conf"
-static char g_tg_conf[560];
+#define TG_CONF_FILE "webui/telegram.conf"
 
 typedef struct {
     char secret[128];
@@ -112,18 +145,13 @@ typedef struct {
     int ws;
 } tg_settings;
 
-static void tg_conf_path(void) {
-    snprintf(g_tg_conf, sizeof(g_tg_conf), "%s/%s", g_project_root, TG_CONF_REL);
-}
-
 static void tg_conf_load(tg_settings *s) {
-    tg_conf_path();
-    strncpy(s->secret, "00000000000000000000000000000000", sizeof(s->secret) - 1);
+    strncpy(s->secret, "00112233445566778899aabbccddeeff", sizeof(s->secret) - 1);
     s->port = 1443;
     s->prefer_ipv6 = 1;
     s->fake_tls = 1;
     s->ws = 1;
-    FILE *f = fopen(g_tg_conf, "r");
+    FILE *f = fopen(TG_CONF_FILE, "r");
     if (!f) return;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -143,7 +171,7 @@ static void tg_conf_load(tg_settings *s) {
 }
 
 static int tg_conf_save(const tg_settings *s) {
-    FILE *f = fopen(g_tg_conf, "w");
+    FILE *f = fopen(TG_CONF_FILE, "w");
     if (!f) return -1;
     fprintf(f, "secret=%s\nport=%d\nprefer_ipv6=%d\nfake_tls=%d\nws=%d\n",
             s->secret, s->port, s->prefer_ipv6, s->fake_tls, s->ws);
@@ -197,7 +225,7 @@ static int telegram_apply(const char *secret, int port, int v6, int tls, int ws,
     if (ws >= 0) s.ws = ws ? 1 : 0;
 
     if (tg_conf_save(&s) != 0) {
-        snprintf(out, out_size, "{\"ok\":false,\"error\":\"не удалось записать %s\"}", TG_CONF_REL);
+        snprintf(out, out_size, "{\"ok\":false,\"error\":\"не удалось записать %s\"}", TG_CONF_FILE);
         return -1;
     }
     char msg[160];
@@ -208,7 +236,9 @@ static int telegram_apply(const char *secret, int port, int v6, int tls, int ws,
     if (start) {
         stop_plugin("telegram");
         usleep(300000);
-        int r = start_plugin("telegram");
+        char terr[256] = {0};
+        int r = start_plugin("telegram", terr, sizeof(terr));
+        if (r != 0 && terr[0]) log_add(terr);
         snprintf(msg, sizeof(msg), "[telegram] перезапуск после смены настроек: %s",
                  r == 0 ? "ok" : (r == -2 ? "уже запущен" : "ошибка"));
         log_add(msg);
@@ -254,7 +284,7 @@ static int ctor_validate_json(const char *spec, char *out, size_t cap) {
     ssize_t w = write(tf, spec, strlen(spec));
     close(tf);
     if (w < 0) { unlink(tmp); return -1; }
-    char cmd[1200];
+    char cmd[512];
     snprintf(cmd, sizeof(cmd), "%s < %s 2>/dev/null", VALIDATOR_BIN, tmp);
     FILE *p = popen(cmd, "r");
     if (!p) { unlink(tmp); return -1; }
@@ -373,12 +403,15 @@ static int port_listening(int port, int udp) {
 
 static int plugin_ports(const char *name, int *udp_port, int *tcp_port) {
     static const struct { const char *name; int udp; int tcp; } ports[] = {
-        {"activision", 18562, 18462}, {"battlenet", 18563, 18463}, {"cloudflaredns", 0, 0},
-        {"discord", 0, 18443}, {"electronicarts", 18564, 18464}, {"epicgames", 18565, 18465},
-        {"github", 18590, 18490}, {"google", 0, 18445}, {"roblox", 18566, 18466}, {"soundcloud", 18567, 18467},
-        {"speedtestbyookla", 0, 18447}, {"spotify", 18556, 18456}, {"steam", 18568, 18468},
-        {"telegram", 0, 1443}, {"twitch", 18558, 18458}, {"vrchat", 15353, 18444},
-        {"x", 0, 18446},
+        {"activision", 18562, 0}, {"battlenet", 18563, 0},
+        {"cloudflaredns", 0, 0}, {"discord", 0, 0},
+        {"electronicarts", 0, 0}, {"epicgames", 18565, 0},
+        {"github", 18590, 0}, {"google", 0, 18445},
+        {"roblox", 18566, 0}, {"soundcloud", 0, 0},
+        {"speedtestbyookla", 0, 0}, {"spotify", 18556, 0},
+        {"steam", 18568, 0}, {"telegram", 0, 1443},
+        {"twitch", 18558, 0}, {"vrchat", 15353, 0},
+        {"x", 0, 0},
         {NULL, 0, 0}
     };
     for (int i = 0; ports[i].name; i++) {
@@ -410,6 +443,29 @@ static int wait_plugin_ready(const char *name, pid_t pid) {
         usleep(100000);
     }
     return -1;
+}
+
+// Вывод модуля (включая сообщение dlopen о падении загрузки) попадает
+// в лог веба, а не теряется в файле. Отсюда же берётся причина ошибки.
+static void drain_plugin_output(plugin_proc_t *p) {
+    if (!p || p->out_fd < 0) return;
+    char buf[2048];
+    for (;;) {
+        ssize_t r = read(p->out_fd, buf, sizeof(buf) - 1);
+        if (r <= 0) break;
+        buf[r] = 0;
+        char *line = buf;
+        while (line && *line) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = 0;
+            if (*line) log_add(line);
+            line = nl ? nl + 1 : NULL;
+        }
+    }
+}
+
+static void drain_all_plugins(void) {
+    for (int i = 0; i < plugin_count; i++) drain_plugin_output(&plugins[i]);
 }
 
 static void drain_pipe(void) {
@@ -549,6 +605,56 @@ static int spawn_shell(const char *cmd) {
     return 0;
 }
 
+// Корень проекта: RMF_ROOT из run.sh, иначе три уровня вверх от бинарника
+// (build/bin/rmf-web -> корень). Раньше здесь был жёсткий абсолютный путь
+// к каталогу конкретной машины, из-за чего пересборка из веба на чужой системе
+// молча ничего не делала.
+static const char *root_dir(void) {
+    static char buf[1024];
+    const char *env = getenv("RMF_ROOT");
+    if (env && env[0]) {
+        snprintf(buf, sizeof(buf), "%s", env);
+        return buf;
+    }
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) { snprintf(buf, sizeof(buf), "."); return buf; }
+    buf[n] = '\0';
+    for (int i = 0; i < 3; i++) {              // снять bin, build, корень
+        char *slash = strrchr(buf, '/');
+        if (slash) *slash = '\0';
+    }
+    return buf;
+}
+
+// Полный перезапуск одной командой: стоп, сборка, старт.
+// Ребёнок отсоединяется от веба двойным fork — иначе он погибнет вместе с ним,
+// и закрывает унаследованные дескрипторы, иначе удержит слушающий сокет и новый
+// веб не сможет занять порт.
+static int spawn_full_restart(void) {
+    pid_t p = fork();
+    if (p < 0) return -1;
+    if (p == 0) {
+        setsid();
+        pid_t q = fork();
+        if (q < 0) _exit(1);
+        if (q > 0) _exit(0);
+        for (int fd = 3; fd < 1024; fd++) close(fd);
+        char logp[1200];
+        snprintf(logp, sizeof(logp), "%s/logs/web.log", root_dir());
+        int lf = open(logp, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (lf >= 0) { dup2(lf, 1); dup2(lf, 2); if (lf > 2) close(lf); }
+        char cmd[2048];
+        const char *sudo = (geteuid() == 0) ? "" : "sudo ";
+        snprintf(cmd, sizeof(cmd), "cd '%s' && %s./run.sh stop && %s./run.sh start",
+                 root_dir(), sudo, sudo);
+        execl("/bin/sh", "sh", "-c", cmd, NULL);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    return 0;
+}
+
 static int is_proxy_running(void) {
     if (proxy_pid <= 0) return 0;
     if (process_alive(proxy_pid)) return 1;
@@ -667,6 +773,7 @@ static plugin_proc_t* add_plugin(const char *name) {
     snprintf(p->name, sizeof(p->name), "%s", name);
     p->pid = 0;
     p->active = 0;
+    p->out_fd = -1;
     return p;
 }
 
@@ -695,27 +802,109 @@ static void terminate_process(pid_t pid) {
     }
 }
 
-static int start_plugin(const char *name) {
+// Текст ошибки попадает в JSON — экранируем кавычки и обратный слэш,
+// иначе причина вроде dlerror испортит ответ целиком.
+static void json_escape(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 2 < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n' || c == '\r' || c == '\t') out[o++] = ' ';
+        else if (c < 0x20) continue;
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+}
+
+static void set_err(char *err, size_t errsz, const char *fmt, ...) {
+    if (!err || errsz == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, errsz, fmt, ap);
+    va_end(ap);
+}
+
+// Причина падения плагина: последняя строка лога, из которой убираем
+// префикс "[PLUGIN] load failed <путь>:" — путь пользователю ничего не даёт.
+static void plugin_error(char *err, size_t errsz, const char *name) {
+    // Причина падения — строка вида "[PLUGIN] load failed <путь>: <dlerror>".
+    // Она может быть не последней в кольце лога, поэтому ищем с конца.
+    int n = log_ring.count < LOG_MAX ? log_ring.count : LOG_MAX;
+    int start = (log_ring.count < LOG_MAX) ? 0 : log_ring.head;
+    char found[520] = {0};
+    for (int i = n - 1; i >= 0 && !found[0]; i--) {
+        const char *line = log_ring.lines[(start + i) % LOG_MAX];
+        if (!strstr(line, "load failed")) continue;
+        char *colon = strstr(line, ": ");
+        snprintf(found, sizeof(found), "%s", (colon && colon[2]) ? colon + 2 : line);
+    }
+    if (found[0]) { set_err(err, errsz, "%s: %s", name, found); return; }
+
+    char last[512] = {0};
+    log_last_line(last, sizeof(last));
+    set_err(err, errsz, "%s: не ответил после запуска (последняя запись лога: %s)",
+            name, last[0] ? last : "пусто");
+}
+
+static int start_plugin(const char *name, char *err, size_t errsz) {
     const char *canonical_name = plugin_canonical_name(name);
-    if (!plugin_name_valid(canonical_name)) return -1;
+    if (!plugin_name_valid(canonical_name)) {
+        set_err(err, errsz, "неизвестное имя плагина: %s", name);
+        return -1;
+    }
     plugin_proc_t *p = find_plugin(canonical_name);
     if (!p) p = add_plugin(canonical_name);
-    if (!p) return -1;
-    if (is_plugin_running(p)) return -2;
+    if (!p) { set_err(err, errsz, "не удалось завести запись о плагине"); return -1; }
+    if (is_plugin_running(p)) { set_err(err, errsz, "уже запущен"); return -2; }
 
-    if (!is_proxy_running() && start_proxy() < 0) return -1;
+    if (!is_proxy_running() && start_proxy() < 0) {
+        set_err(err, errsz, "не удалось запустить прокси на 127.0.0.1:53");
+        return -1;
+    }
+
+    int ofd[2];
+    if (pipe(ofd) != 0) { set_err(err, errsz, "pipe не удался: %s", strerror(errno)); return -1; }
 
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        close(ofd[0]); close(ofd[1]);
+        set_err(err, errsz, "fork не удался: %s", strerror(errno));
+        return -1;
+    }
     if (pid == 0) {
+        close(ofd[0]);
+        if (dup2(ofd[1], STDOUT_FILENO) < 0 || dup2(ofd[1], STDERR_FILENO) < 0)
+            _exit(127);
+        close(ofd[1]);
         char arg[256];
         snprintf(arg, sizeof(arg), "--%s", canonical_name);
         execl(PROXY_BIN, PROXY_BIN, "plugin", arg, NULL);
         _exit(127);
     }
+    close(ofd[1]);
+    int fl = fcntl(ofd[0], F_GETFL, 0);
+    if (fl >= 0) fcntl(ofd[0], F_SETFL, fl | O_NONBLOCK);
+    p->out_fd = ofd[0];
     p->pid = pid;
     p->active = 0;
+    // Ждём именно строку ядра «[PLUGIN] <имя> running.» — она печатается после
+    // того, как модуль отработал inject и поставил правила. Раньше проверка
+    // шла только по живому процессу, поэтому API успевал ответить ok, пока
+    // правила ещё не появились, и следующий же запрос уходил мимо них.
+    char ready_needle[160];
+    snprintf(ready_needle, sizeof(ready_needle), "[PLUGIN] %s running.", canonical_name);
+    for (int i = 0; i < 50; i++) {
+        drain_all_plugins();                 // вывод модуля идёт через пайп
+        if (log_contains(ready_needle)) break;
+        if (!process_alive(pid)) break;
+        usleep(100000);
+    }
+
     if (wait_plugin_ready(canonical_name, pid) < 0) {
+        drain_plugin_output(p);          // забрать сообщение о падении
+        plugin_error(err, errsz, canonical_name);
+        close(p->out_fd);
+        p->out_fd = -1;
         terminate_process(pid);
         waitpid(pid, NULL, 0);
         p->pid = 0;
@@ -724,11 +913,14 @@ static int start_plugin(const char *name) {
     }
     p->active = 1;
 
+    flush_dns_cache();
+
     char timebuf[64];
     time_t now = time(NULL);
     strftime(timebuf, sizeof(timebuf), "%H:%M:%S", localtime(&now));
     char msg[256];
-    snprintf(msg, sizeof(msg), "[%s] Plugin %s started PID %d", timebuf, canonical_name, pid);
+    snprintf(msg, sizeof(msg), "[%s] Plugin %s started PID %d, кэш DNS сброшен",
+             timebuf, canonical_name, pid);
     log_add(msg);
     return 0;
 }
@@ -743,6 +935,8 @@ static int stop_plugin(const char *name) {
         p->pid = 0;
         p->active = 0;
         terminate_process(pid);
+        drain_plugin_output(p);
+        if (p->out_fd >= 0) { close(p->out_fd); p->out_fd = -1; }
 
         char timebuf[64];
         time_t now = time(NULL);
@@ -786,7 +980,7 @@ static int do_backup(void) {
     struct tm *t = localtime(&now);
     snprintf(dst, sizeof(dst), BACKUP_DIR "/rmf_%04d%02d%02d_%02d%02d%02d.tar.gz",
         t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
-    char cmd[1200];
+    char cmd[512];
     snprintf(cmd, sizeof(cmd), "tar czf %s --exclude='%s' --exclude='build' -C . . 2>/dev/null", dst, BACKUP_DIR);
     int r = spawn_shell(cmd);
     char timebuf[64];
@@ -1008,9 +1202,17 @@ static void handle_request(int fd) {
         const char *qp = strstr(path, "?plugin=");
         if (qp) strncpy(plugin, qp + 8, sizeof(plugin) - 1);
         if (!plugin[0]) { send_json(fd, "400 Bad Request", "{\"error\":\"no plugin\"}"); close(fd); return; }
-        int r = start_plugin(plugin);
-        if (r == -2) send_json(fd, "200 OK", "{\"ok\":false,\"error\":\"already running\"}");
-        else send_json(fd, "200 OK", r == 0 ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"fork failed\"}");
+        char err[256] = {0};
+        int r = start_plugin(plugin, err, sizeof(err));
+        if (r == 0) {
+            send_json(fd, "200 OK", "{\"ok\":true}");
+        } else {
+            char esc[400];
+            json_escape(err[0] ? err : "неизвестная ошибка", esc, sizeof(esc));
+            char json[512];
+            snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}", esc);
+            send_json(fd, "200 OK", json);
+        }
     } else if (strcmp(path, "/api/stopall") == 0) {
         stop_all_plugins();
         stop_proxy();
@@ -1036,16 +1238,24 @@ static void handle_request(int fd) {
             close(fd);
             return;
         }
-        char cmd[1200];
-        if (plugin[0]) snprintf(cmd, sizeof(cmd), "cd %s && make build/bin/plugs/%s.xo 2>&1", g_project_root, canonical_name);
-        else snprintf(cmd, sizeof(cmd), "cd %s && make core plugs webui 2>&1", g_project_root);
+        char cmd[512];
+        if (plugin[0]) snprintf(cmd, sizeof(cmd), "cd '%s' && make build/bin/plugs/%s.xo 2>&1",
+                                root_dir(), canonical_name);
+        else snprintf(cmd, sizeof(cmd), "cd '%s' && make core plugs webui 2>&1", root_dir());
         int r = spawn_shell(cmd);
+        send_json(fd, "200 OK", r == 0 ? "{\"ok\":true,\"queued\":true}" : "{\"ok\":false}");
+    } else if (strncmp(path, "/api/save", 9) == 0) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "cd '%s' && ./run.sh save 2>&1", root_dir());
+        int r = spawn_shell(cmd);
+        log_add("сейв состояния запрошен (cache/save)");
         send_json(fd, "200 OK", r == 0 ? "{\"ok\":true,\"queued\":true}" : "{\"ok\":false}");
     } else if (strcmp(path, "/api/flush") == 0) {
         const char *cmd =
-            "for ch in GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS XCOM_BYPASS SPEEDTEST_BYPASS "
-            "ACTIVISION_BYPASS BATTLENET_BYPASS ELECTRONICARTS_BYPASS EPICGAMES_BYPASS ROBLOX_BYPASS "
-            "SOUNDCLOUD_BYPASS STEAM_BYPASS TWITCH_BYPASS RMF_DNS; do "
+            "for ch in GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS "
+            "NINEGAG_BYPASS NETFLIX_BYPASS REDDIT_BYPASS SPOTIFY_BYPASS TWITCH_BYPASS "
+            "VK_BYPASS ROBLOX_BYPASS STEAM_BYPASS ACTIVISION_BYPASS BATTLENET_BYPASS "
+            "EPICGAMES_BYPASS HF_BYPASS RMF_DNS; do "
             "iptables -t nat -D OUTPUT -j \"$ch\" 2>/dev/null; "
             "iptables -t nat -F \"$ch\" 2>/dev/null; "
             "iptables -t nat -X \"$ch\" 2>/dev/null; "
@@ -1058,9 +1268,9 @@ static void handle_request(int fd) {
             "{\"name\":\"rmf\",\"version\":\"3.1\",\"api\":["
             "\"GET /api/status\",\"GET /api/plugins\",\"GET /api/logs\","
             "\"POST /api/start?plugin=<name>\",\"POST /api/stop?plugin=<name>\","
-            "\"POST /api/stopall\",\"POST /api/backup\","
+            "\"POST /api/stopall\",\"POST /api/backup\",\"POST /api/save\","
             "\"POST /api/rebuild?plugin=<name>\",\"POST /api/rebuild\",\"POST /api/flush\","
-            "\"POST /api/restart?target=web|proxy\",\"GET /api/info\"]}");
+            "\"POST /api/restart?target=web|proxy|all\",\"GET /api/info\"]}");
     } else if (strncmp(path, "/api/restart", 12) == 0) {
         char target[64] = {0};
         const char *qp = strstr(path, "?target=");
@@ -1070,6 +1280,12 @@ static void handle_request(int fd) {
             start_proxy();
             log_add("proxy restarted");
             send_json(fd, "200 OK", "{\"ok\":true}");
+        } else if (strcmp(target, "all") == 0 || strcmp(target, "full") == 0) {
+            int r = spawn_full_restart();
+            log_add("полный перезапуск: стоп, сборка, старт");
+            send_json(fd, "202 Accepted",
+                      r == 0 ? "{\"ok\":true,\"msg\":\"стоп, сборка, старт — веб вернётся через несколько секунд\"}"
+                             : "{\"ok\":false,\"error\":\"не удалось запустить перезапуск\"}");
         } else {
             send_json(fd, "200 OK", "{\"ok\":true,\"note\":\"restarting web\"}");
             running = 0;
@@ -1195,6 +1411,7 @@ int main(int argc, char *argv[]) {
         if (fds[1].fd >= 0 &&
             (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
             drain_pipe();
+        drain_all_plugins();
 
         if (fds[0].revents & POLLIN) {
             struct sockaddr_in cli;

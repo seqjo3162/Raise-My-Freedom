@@ -58,19 +58,23 @@ static int build_query(const char *domain, unsigned char *pkt, int cap) {
     return (int)(p - pkt);
 }
 
-static int parse_a(const unsigned char *resp, int n, char *out_ip, int out_ip_len) {
+// Собирает все A-записи ответа, а не только первую: у сайтов за Cloudflare и
+// CloudFront их обычно несколько, и первая нередко оказывается недостижимой
+// именно с этой сети.
+static int parse_a_list(const unsigned char *resp, int n, char out[][64],
+                        int max, int *count) {
     if (n < 12) return -1;
     int ancount = (resp[6] << 8) | resp[7];
     if (ancount <= 0) return -1;
+    *count = 0;
     int off = 12;
-    // skip QNAME
     while (off < n && resp[off] != 0) {
         if ((resp[off] & 0xC0) == 0xC0) { off += 2; break; }
         off += resp[off] + 1;
     }
     if (off < n && resp[off] == 0) off++;
-    off += 4; // type+class
-    while (off + 10 < n) {
+    off += 4;
+    while (off + 10 < n && *count < max) {
         if ((resp[off] & 0xC0) == 0xC0) off += 2;
         else {
             while (off < n && resp[off] != 0 && (resp[off] & 0xC0) != 0xC0)
@@ -83,13 +87,85 @@ static int parse_a(const unsigned char *resp, int n, char *out_ip, int out_ip_le
         int rdlen = (resp[off + 8] << 8) | resp[off + 9];
         off += 10;
         if (type == 1 && rdlen == 4 && off + 4 <= n) {
-            snprintf(out_ip, (size_t)out_ip_len, "%u.%u.%u.%u",
-                     resp[off], resp[off + 1], resp[off + 2], resp[off + 3]);
-            return 0;
+            int dup = 0;
+            for (int i = 0; i < *count; i++) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u",
+                         resp[off], resp[off + 1], resp[off + 2], resp[off + 3]);
+                if (strcmp(out[i], tmp) == 0) dup = 1;
+            }
+            if (!dup)
+                snprintf(out[(*count)++], 64, "%u.%u.%u.%u",
+                         resp[off], resp[off + 1], resp[off + 2], resp[off + 3]);
+        } else {
+            off += rdlen;
         }
-        off += rdlen;
     }
-    return -1;
+    return (*count > 0) ? 0 : -1;
+}
+
+static int parse_a(const unsigned char *resp, int n, char *out_ip, int out_ip_len) {
+    char list[8][64];
+    int count = 0;
+    if (parse_a_list(resp, n, list, 8, &count) != 0) return -1;
+    snprintf(out_ip, (size_t)out_ip_len, "%s", list[0]);
+    return 0;
+}
+
+// Запрашивает A-записи у DoH-резолверов и отдаёт до max адресов.
+int doh_resolve_a_multi(const char *domain, char out[][64], int max, int *count) {
+    *count = 0;
+    if (!domain || !out || max <= 0) return -1;
+
+    unsigned char q[512];
+    int qlen = build_query(domain, q, sizeof(q));
+    if (qlen < 0) return -1;
+
+    char b64[768];
+    b64url_encode(q, qlen, b64, sizeof(b64));
+
+    char tmpl[] = "/tmp/mz-doh-XXXXXX";
+    int tfd = mkstemp(tmpl);
+    if (tfd < 0) return -1;
+    close(tfd);
+
+    static const struct {
+        const char *url;
+        const char *resolve;
+    } hosts[] = {
+        {"https://cloudflare-dns.com/dns-query?dns=", "cloudflare-dns.com:443:1.1.1.1"},
+        {"https://dns.google/dns-query?dns=", "dns.google:443:8.8.8.8"},
+        {NULL, NULL}
+    };
+    int result = -1;
+    struct sigaction ign, oldc;
+    sigemptyset(&ign.sa_mask);
+    ign.sa_handler = SIG_DFL;
+    ign.sa_flags = 0;
+    sigaction(SIGCHLD, &ign, &oldc);
+    for (int h = 0; hosts[h].url; h++) {
+        char url[900];
+        snprintf(url, sizeof(url), "%s%s", hosts[h].url, b64);
+        char cmd[1200];
+        snprintf(cmd, sizeof(cmd),
+                 "curl -sS --fail --max-time 5 --resolve '%s' "
+                 "-H 'accept: application/dns-message' "
+                 "'%s' -o '%s' 2>/dev/null",
+                 hosts[h].resolve, url, tmpl);
+        if (system(cmd) != 0) continue;
+        FILE *f = fopen(tmpl, "rb");
+        if (!f) continue;
+        unsigned char resp[2048];
+        size_t n = fread(resp, 1, sizeof(resp), f);
+        fclose(f);
+        if (n >= 12 && resp[0] == 0xAB && resp[1] == 0xCD) {
+            result = parse_a_list(resp, (int)n, out, max, count);
+            if (result == 0) break;
+        }
+    }
+    sigaction(SIGCHLD, &oldc, NULL);
+    unlink(tmpl);
+    return result;
 }
 
 int doh_resolve_a(const char *domain, char *out_ip, int out_ip_len) {

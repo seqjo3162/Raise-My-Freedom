@@ -24,7 +24,7 @@
 // ready_pipe declared below for relay_child after listen()
 
 #define CH_TIMEOUT_SEC  8
-#define SPLICE_IDLE_SEC 120
+#define SPLICE_IDLE_SEC 30
 #define MAX_CH_BUF      (1 << 20)
 
 static int ready_pipe[2] = {-1, -1};
@@ -33,6 +33,12 @@ static int g_port = 0;
 static unsigned int g_mark = 0x4d5b;
 static int g_delay_ms = 30;
 static int g_first_seg = 20;
+static int g_split_data = 0;
+static int g_split_size = 512;
+static int g_split_delay_ms = 1;
+static int g_split_ch = 1;
+static int g_data_chunk = 4096;
+static int g_data_pause_ms = 1;   // -1 = без паузы
 static char g_dns1[32] = "1.1.1.1";
 static char g_dns2[32] = "8.8.8.8";
 static int (*g_validate_ip)(const char *ip);
@@ -53,9 +59,17 @@ static void msleep(int ms) {
 
 // ── диагностика (SNI_RELAY_DEBUG=1) ───────────────────────────────────────
 static int g_dbg = -1;
+// Список имён, для которых сдвигается регистр первой буквы SNI.
+static int g_dbg_fd = -1;
+static int g_no_split_recs;
+// Включается только переменной окружения. Раньше здесь ещё проверялось
+// наличие файла /tmp/sni-debug, из-за чего подробный лог включался у всех, кто
+// этот файл создал, без всякого запроса.
 static int dbg_on(void) {
-    if (g_dbg < 0)
-        g_dbg = (getenv("SNI_RELAY_DEBUG") || access("/tmp/sni-debug", F_OK) == 0) ? 1 : 0;
+    if (g_dbg < 0) {
+        const char *v = getenv("SNI_RELAY_DEBUG");
+        g_dbg = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
     return g_dbg;
 }
 static long now_ms(void) {
@@ -66,12 +80,31 @@ static long now_ms(void) {
 static long g_t0 = 0;
 static void dbg(const char *fmt, ...) {
     if (!dbg_on()) return;
-    va_list ap;
+    // Дублируем в файл: кольцо лога веба переполняется чужими соединениями,
+    // и строка нужного соединения вытесняется раньше, чем её успевают прочитать.
+    if (g_dbg_fd < 0)
+        g_dbg_fd = open("/tmp/sni-debug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    va_list ap, ap_err, ap_file;
     va_start(ap, fmt);
+    // Обе копии берём ДО первого использования ap: после vfprintf список
+    // аргументов уже непригоден, и повторное чтение даёт мусор вместо значений.
+    va_copy(ap_err, ap);
+    va_copy(ap_file, ap);
+
     fprintf(stderr, "[relay %d +%ldms] ", (int)getpid(), now_ms() - g_t0);
-    vfprintf(stderr, fmt, ap);
+    vfprintf(stderr, fmt, ap_err);
     fputc('\n', stderr);
     fflush(stderr);
+
+    if (g_dbg_fd >= 0) {
+        dprintf(g_dbg_fd, "[relay %d +%ldms] ", (int)getpid(), now_ms() - g_t0);
+        vdprintf(g_dbg_fd, fmt, ap_file);
+        dprintf(g_dbg_fd, "\n");
+    }
+
+    va_end(ap_file);
+    va_end(ap_err);
     va_end(ap);
 }
 
@@ -141,6 +174,56 @@ int sni_find_split(const unsigned char *hs, int hs_len) {
     }
     return -1;
 }
+
+// Меняет регистр первой буквы имени в SNI.
+//
+// DNS и SNI регистронезависимы: сервер имя не различает и отвечает как обычно.
+// А фильтр у провайдера сравнивает имя побайтово, от точного регистра, и режет
+// поток. Проверено на одном адресе (172.217.113.4) с SNI youtubei.googleapis.com:
+//   youtubei.googleapis.com   — тишина
+//   Youtubei.googleapis.com   — ответ
+//   YOUTUBEI.GOOGLEAPIS.COM   — ответ
+//   youtubei.Googleapis.com   — тишина (важна первая буква имени)
+// Значит достаточно поменять регистр первой буквы, длину и контрольные суммы
+// трогать не нужно — длина байтов та же.
+void sni_shift_case(unsigned char *hs, int hs_len) {
+    if (!hs || hs_len < 46 || hs[0] != 0x01) return;
+    int body_len = ((hs[1] << 16) | (hs[2] << 8) | hs[3]);
+    if (body_len != hs_len - 4 || body_len < 38) return;
+    unsigned char *body = hs + 4;
+    int p = 2 + 32;
+    if (p >= body_len) return;
+    int sid_len = body[p]; p += 1 + sid_len;
+    if (p + 2 > body_len) return;
+    int cs_len = (body[p] << 8) | body[p + 1]; p += 2 + cs_len;
+    if (p >= body_len) return;
+    int comp_len = body[p]; p += 1 + comp_len;
+    if (p + 2 > body_len) return;
+    int ext_total = (body[p] << 8) | body[p + 1]; p += 2;
+    int end = p + ext_total;
+    if (end > body_len) return;
+
+    while (p + 4 <= end) {
+        int et = (body[p] << 8) | body[p + 1];
+        int el = (body[p + 2] << 8) | body[p + 3];
+        if (p + 4 + el > end) return;
+        if (et == 0x0000 && el >= 5) {
+            unsigned char *ed = body + p + 4;
+            int nlen = (ed[3] << 8) | ed[4];
+            unsigned char *name = ed + 5;
+            if (nlen > 0 && name + nlen <= body + body_len) {
+                unsigned char c = name[0];
+                name[0] = (c >= 'a' && c <= 'z') ? (unsigned char)(c - 32)
+                                                  : (unsigned char)(c + 32);
+            }
+            return;
+        }
+        p += 4 + el;
+    }
+}
+
+
+
 
 int sni_build_fragmented_ch(const unsigned char *hs, int hs_len,
                             unsigned char *out, int out_cap, int *first_seg_out) {
@@ -231,6 +314,19 @@ static int extract_client_hello(const unsigned char *buf, int len,
     return 0;
 }
 
+// Полная отправка: короткий write на заполненном буфере не должен рвать поток,
+// иначе клиент видит оборванный ответ вместо ошибки.
+static int send_all(int fd, const void *data, size_t n) {
+    const unsigned char *p = data;
+    while (n > 0) {
+        ssize_t s = send(fd, p, n, MSG_NOSIGNAL);
+        if (s > 0) { p += s; n -= (size_t)s; continue; }
+        if (s < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
 static void splice_loop(int a, int b) {
     const char *why = "unknown";
     long got_c = 0, got_s = 0, sent_c = 0, sent_s = 0;
@@ -260,7 +356,7 @@ static void splice_loop(int a, int b) {
             int off = 0;
             while (off < n) {
                 int remain = (int)n - off;
-                if (remain >= 5 && buf[off] == 0x16) {
+                if (!g_no_split_recs && remain >= 5 && buf[off] == 0x16) {
                     int rlen = (buf[off + 3] << 8) | buf[off + 4];
                     int rec_end = off + 5 + rlen;
                     if (rec_end <= n && rlen > 200) {
@@ -268,19 +364,55 @@ static void splice_loop(int a, int b) {
                         if (split < 1) split = 1;
                         dbg("split off=%d rlen=%d split=%d dir=%c", off, rlen, split,
                             (i == 0) ? 'C' : 'S');
-                        if (send(dst, buf + off, 5, MSG_NOSIGNAL) != 5) { why = "send-hdr1"; goto out; }
-                        if (send(dst, buf + off + 5, (size_t)split, MSG_NOSIGNAL) != split) { why = "send-p1"; goto out; }
+                        // Заголовок первой половины объявляет длину СВОЕЙ
+                        // половины. С исходным заголовком (полная длина записи)
+                        // получатель читал вторую половину и заголовок второй
+                        // записи как продолжение первой — поток разъезжался на
+                        // крупных ответах, и клиент отвечал алертом.
+                        unsigned char hdr1[5] = {0x16, buf[off + 1], buf[off + 2],
+                                                 (unsigned char)((split >> 8) & 0xFF),
+                                                 (unsigned char)(split & 0xFF)};
+                        if (send_all(dst, hdr1, 5) != 0) { why = "send-hdr1"; goto out; }
+                        if (send_all(dst, buf + off + 5, (size_t)split) != 0) { why = "send-p1"; goto out; }
                         msleep(1);
                         int hdr2[5] = {0x16, 0x03, 0x01,
                                         ((rlen - split) >> 8) & 0xFF, (rlen - split) & 0xFF};
-                        if (send(dst, hdr2, 5, MSG_NOSIGNAL) != 5) { why = "send-hdr2"; goto out; }
-                        if (send(dst, buf + off + 5 + split, (size_t)(rlen - split), MSG_NOSIGNAL) != rlen - split) { why = "send-p2"; goto out; }
+                        if (send_all(dst, hdr2, 5) != 0) { why = "send-hdr2"; goto out; }
+                        if (send_all(dst, buf + off + 5 + split, (size_t)(rlen - split)) != 0) { why = "send-p2"; goto out; }
+                        off = rec_end;
+                        continue;
+                    }
+                }
+                // Дробление записей с данными: DPI не должен иметь возможности
+                // собрать перезаписанные TLS-записи и оценить объём ответа.
+                if (g_split_data && remain >= 5 && buf[off] == 0x17) {
+                    int rlen = (buf[off + 3] << 8) | buf[off + 4];
+                    int rec_end = off + 5 + rlen;
+                    if (rec_end <= n && rlen > g_split_size) {
+                        int body = 5, end = 5 + rlen;
+                        while (body < end) {
+                            int chunk = end - body;
+                            if (chunk > g_split_size) chunk = g_split_size;
+                            unsigned char hdr[5] = {0x17, buf[off + 1], buf[off + 2],
+                                                    (unsigned char)((chunk >> 8) & 0xFF),
+                                                    (unsigned char)(chunk & 0xFF)};
+                            if (send_all(dst, hdr, 5) != 0 ||
+                                send_all(dst, buf + off + body, (size_t)chunk) != 0) {
+                                why = "send-split";
+                                goto out;
+                            }
+                            body += chunk;
+                            if (body < end) msleep(g_split_delay_ms);
+                        }
+                        dbg("data-split off=%d rlen=%d parts=%d dir=%c", off, rlen,
+                            (rlen + g_split_size - 1) / g_split_size, (i == 0) ? 'C' : 'S');
+                        if (i == 0) sent_c += rlen; else sent_s += rlen;
                         off = rec_end;
                         continue;
                     }
                 }
                 int chunk = remain;
-                if (chunk > 4096) chunk = 4096;
+                if (chunk > g_data_chunk) chunk = g_data_chunk;
                 ssize_t s = send(dst, buf + off, (size_t)chunk, MSG_NOSIGNAL);
                 if (s != chunk) {
                     dbg("send short want=%d got=%zd errno=%d dir=%c", chunk, s, errno,
@@ -290,7 +422,7 @@ static void splice_loop(int a, int b) {
                 }
                 if (i == 0) sent_c += s; else sent_s += s;
                 off += chunk;
-                if (chunk >= 4096) msleep(1);
+                if (g_data_pause_ms > 0) msleep(g_data_pause_ms);
             }
         }
     }
@@ -482,21 +614,30 @@ static void handle_conn(int cfd) {
     dbg("conn: ufd=%d sni=%s", ufd, sni);
 
     static unsigned char frag[65536 * 2];
-    int flen = sni_build_fragmented_ch(hs, hs_len, frag, (int)sizeof(frag), NULL);
     int ok = 0;
-    if (flen > 0) {
-        int fs = g_first_seg > 0 ? g_first_seg : 20;
-        int r1_len = 5 + sni_find_split(hs, hs_len);
-        if (r1_len < 6) r1_len = flen / 2;
-        if (fs >= r1_len) fs = r1_len - 1;
-        if (fs < 1) fs = 1;
-        if (send(ufd, frag, (size_t)fs, MSG_NOSIGNAL) == fs) {
-            msleep(g_delay_ms > 0 ? g_delay_ms : 30);
-            ok = (send(ufd, frag + fs, (size_t)(flen - fs), MSG_NOSIGNAL) == flen - fs);
+    if (g_split_ch) {
+        int flen = sni_build_fragmented_ch(hs, hs_len, frag, (int)sizeof(frag), NULL);
+        if (flen > 0) {
+            int fs = g_first_seg > 0 ? g_first_seg : 20;
+            int r1_len = 5 + sni_find_split(hs, hs_len);
+            if (r1_len < 6) r1_len = flen / 2;
+            if (fs >= r1_len) fs = r1_len - 1;
+            if (fs < 1) fs = 1;
+            if (send_all(ufd, frag, (size_t)fs) == 0) {
+                msleep(g_delay_ms > 0 ? g_delay_ms : 30);
+                ok = (send_all(ufd, frag + fs, (size_t)(flen - fs)) == 0);
+            }
         }
+        if (!ok) { dbg("conn: frag send failed"); close(ufd); free(buf); return; }
+        dbg("conn: frag ok flen=%d", flen);
+    } else {
+        // ClientHello уходит без разрыва SNI: диагностический режим, для
+        // сравнения с режимом разрыва.
+        ok = (send_all(ufd, buf, (size_t)consumed) == 0);
+        if (!ok) { dbg("conn: plain CH send failed"); close(ufd); free(buf); return; }
+        dbg("conn: plain CH ok len=%d", consumed);
+        consumed = blen;
     }
-    if (!ok) { dbg("conn: frag send failed flen=%d", flen); close(ufd); free(buf); return; }
-    dbg("conn: frag ok flen=%d leftover=%d", flen, blen - consumed);
 
     if (consumed < blen) {
         ssize_t s2 = send(ufd, buf + consumed, (size_t)(blen - consumed), MSG_NOSIGNAL);
@@ -515,7 +656,7 @@ static void relay_child(int port) {
     dprintf(2, "[relay] RAW child banner pid=%d port=%d dbg=%d env=%s flag=%d\n",
             (int)getpid(), port, dbg_on(),
             getenv("SNI_RELAY_DEBUG") ? getenv("SNI_RELAY_DEBUG") : "-",
-            access("/tmp/sni-debug", F_OK));
+            -1);
     setsid();
     g_t0 = now_ms();
     dbg("relay child started port=%d dbg=%d", port, dbg_on());
@@ -589,6 +730,15 @@ int sni_relay_start(const sni_relay_config_t *cfg) {
         char *c = strchr(g_dns2, ':'); if (c) *c = '\0';
     }
     g_validate_ip = cfg ? cfg->validate_ip : NULL;
+    g_no_split_recs = (cfg && cfg->no_split_handshake_records) ? 1 : 0;
+    g_split_data = (cfg && cfg->split_data_records) ? 1 : 0;
+    g_split_size = (cfg && cfg->split_record_size > 0) ? cfg->split_record_size : 512;
+    g_split_delay_ms = (cfg && cfg->split_record_delay_ms > 0) ? cfg->split_record_delay_ms : 1;
+    // Незаданное поле = 0 = прежнее поведение (разрыв ClientHello включён).
+    g_split_ch = (cfg && cfg->no_split_client_hello) ? 0 : 1;
+    g_data_chunk = (cfg && cfg->data_chunk > 0) ? cfg->data_chunk : 4096;
+    g_data_pause_ms = (cfg && cfg->data_pause_ms < 0) ? -1
+                      : (cfg && cfg->data_pause_ms > 0) ? cfg->data_pause_ms : 1;
     memset(g_fallback_ips, 0, sizeof(g_fallback_ips));
     g_fallback_count = cfg && cfg->fallback_count < 16 ? cfg->fallback_count : (cfg ? 16 : 0);
     for (size_t i = 0; i < g_fallback_count; i++)

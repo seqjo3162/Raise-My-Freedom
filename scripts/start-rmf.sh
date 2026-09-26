@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$ROOT_DIR/build/bin/rmf"
 PLUGS_DIR="$ROOT_DIR/build/bin/plugs"
-PLUGIN="${1:-discord}"
+PLUGIN="${1:-github}"
 
 set -e
 

@@ -1,7 +1,9 @@
 #include "src/modules/vrchat/include/header.h"
-#include "src/common/sni_relay.h"
+#include "src/dns/doh_resolve.h"
+#include "src/common/plain_relay.h"
 
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -89,6 +91,51 @@ static const char *vrchat_notable[] = {
 };
 
 static pid_t responder_pid = -1;
+
+// Настройки релея. Читаются из webui/vrchat.conf при каждом inject, поэтому
+// перебор вариантов не требует пересборки. Файл опционален.
+#define VRCHAT_CONF "webui/vrchat.conf"
+
+// По умолчанию релей выключен: измерено 2026-09-25, что прямые соединения на
+// пинованные адреса VRChat проходят целиком, а пропуск трафика через
+// релей рвал поток примерно на 20 КБ. Обход на этом провайдере делает
+// DNS-пиннинг (модуль отвечает сам, минуя подменённый провайдерский ответ).
+// Релей включается только если без него не обойтись: use_relay=1.
+static int opt_use_relay = 0;
+static int opt_relay_chunk = 0;        // 0 = пересылать как есть
+static int opt_relay_pause_ms = 0;     // 0 = без пауз
+static int opt_relay_idle_sec = 0;     // 0 = не обрывать по простою
+
+static int conf_int(const char *path, const char *key, int def) {
+    FILE *f = fopen(path, "r");
+    if (!f) return def;
+    char line[256];
+    int val = def;
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        if (strncmp(p, key, klen) != 0 || p[klen] != '=') continue;
+        val = atoi(p + klen + 1);
+        break;
+    }
+    fclose(f);
+    return val;
+}
+
+static void load_strategy(void) {
+    opt_use_relay       = conf_int(VRCHAT_CONF, "use_relay", 0);
+    opt_relay_chunk     = conf_int(VRCHAT_CONF, "relay_chunk", 0);
+    opt_relay_pause_ms  = conf_int(VRCHAT_CONF, "relay_pause_ms", 0);
+    opt_relay_idle_sec  = conf_int(VRCHAT_CONF, "relay_idle_sec", 0);
+    if (conf_int(VRCHAT_CONF, "split_ch", 0) != 0)
+        fprintf(stderr, "[VRCHAT] split_ch=1 в конфиге игнорируется: релей модуля "
+                        "не изменяет ClientHello\n");
+    if (opt_relay_chunk < 0) opt_relay_chunk = 0;
+    if (opt_relay_pause_ms < 0) opt_relay_pause_ms = 0;
+    if (opt_relay_idle_sec < 0) opt_relay_idle_sec = 0;
+}
 
 static int is_root(void) { return getuid() == 0; }
 
@@ -189,6 +236,99 @@ static const char *lookup_ip(const char *domain) {
             return vrchat_suffix_pins[i].ip;
     }
     return NULL;
+}
+
+// ── кеш адресов для доменов vrchat, которых нет в статической таблице ──
+//
+// Раньше такие домены уходили в апстрим, где им отдавали новый адрес на каждый
+// запрос. Клиент VRChat видел постоянно меняющийся набор серверов и считал это
+// подменой трафика. Поэтому адрес запоминается и переиспользуется, пока
+// отвечает; переспрашивается только когда прежний не отвечает.
+#define VC_CACHE_MAX 128
+static char vc_dom[VC_CACHE_MAX][256];
+static char vc_ip[VC_CACHE_MAX][64];
+static int vc_cache_n;
+static int vc_cache_loaded;
+
+static void vc_cache_path(char *out, size_t cap) {
+    snprintf(out, cap, "/run/rmf/pins/VRCHAT.pin");
+}
+
+static void vc_cache_load(void) {
+    vc_cache_n = 0;
+    vc_cache_loaded = 1;
+    char path[512];
+    vc_cache_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[400];
+    while (vc_cache_n < VC_CACHE_MAX && fgets(line, sizeof(line), f)) {
+        char d[256], ip[64];
+        if (sscanf(line, "%255s %63s", d, ip) != 2) continue;
+        snprintf(vc_dom[vc_cache_n], sizeof(vc_dom[0]), "%s", d);
+        snprintf(vc_ip[vc_cache_n], sizeof(vc_ip[0]), "%s", ip);
+        vc_cache_n++;
+    }
+    fclose(f);
+}
+
+static const char *vc_cache_get(const char *domain) {
+    if (!vc_cache_loaded) vc_cache_load();
+    for (int i = 0; i < vc_cache_n; i++)
+        if (strcasecmp(vc_dom[i], domain) == 0) return vc_ip[i];
+    return NULL;
+}
+
+static void vc_cache_put(const char *domain, const char *ip) {
+    if (!vc_cache_loaded) vc_cache_load();
+    for (int i = 0; i < vc_cache_n; i++) {
+        if (strcasecmp(vc_dom[i], domain) != 0) continue;
+        if (strcmp(vc_ip[i], ip) == 0) return;
+        snprintf(vc_ip[i], sizeof(vc_ip[0]), "%s", ip);   // адрес сменился
+        goto save;
+    }
+    if (vc_cache_n >= VC_CACHE_MAX) return;
+    snprintf(vc_dom[vc_cache_n], sizeof(vc_dom[0]), "%s", domain);
+    snprintf(vc_ip[vc_cache_n], sizeof(vc_ip[0]), "%s", ip);
+    vc_cache_n++;
+save:
+    mkdir("/run/rmf", 0755);
+    mkdir("/run/rmf/pins", 0755);
+    char path[512], tmp[560];
+    vc_cache_path(path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < vc_cache_n; i++)
+        fprintf(f, "%s %s\n", vc_dom[i], vc_ip[i]);
+    fclose(f);
+    rename(tmp, path);
+}
+
+// Домен в зоне vrchat? Только такие имеет смысл закреплять.
+static int in_vrchat_zone(const char *domain) {
+    static const char *zones[] = { "vrchat.com", "vrchat.cloud", NULL };
+    size_t dl = strlen(domain);
+    for (int i = 0; zones[i]; i++) {
+        size_t zl = strlen(zones[i]);
+        if (dl == zl && strcasecmp(domain, zones[i]) == 0) return 1;
+        if (dl > zl && domain[dl - zl - 1] == '.' &&
+            strcasecmp(domain + dl - zl, zones[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+// Адрес для домена: статическая таблица, затем кеш, затем разовое разрешение.
+static const char *resolve_vrchat(const char *domain, char *out, size_t out_len) {
+    const char *ip = lookup_ip(domain);
+    if (ip) return ip;
+    ip = vc_cache_get(domain);
+    if (ip) return ip;
+    out[0] = '\0';
+    if (!in_vrchat_zone(domain)) return NULL;
+    if (doh_resolve_a(domain, out, (int)out_len) != 0) { out[0] = '\0'; return NULL; }
+    if (out[0]) vc_cache_put(domain, out);
+    return out;
 }
 
 // ── minimal DNS message helpers (same shape as core proxy) ───────────────
@@ -328,7 +468,8 @@ static void responder_loop(int ready_fd) {
         int qpos = skip_qname(q, (int)n);
         int qtype = (qpos + 1 < n) ? (q[qpos] << 8) | q[qpos + 1] : 0;
 
-        const char *ip = lookup_ip(dom);
+        char fresh[64] = {0};
+        const char *ip = resolve_vrchat(dom, fresh, sizeof(fresh));
         int rl;
         if (ip) {
             rl = (qtype == 1) ? build_a_resp(q, (int)n, r, sizeof(r), ip)
@@ -430,51 +571,57 @@ void vrchat_module_inject(int fd) {
         return;
     }
 
+    load_strategy();
     iptables_base();
     for (int i = 0; vrchat_zones[i]; i++)
         iptables_add_dns_rule(vrchat_zones[i]);
 
-    printf("[VRCHAT] inject: zone rules -> 127.0.0.1:%d, relay :%d\n",
-           VRCHAT_DNS_PORT, VRCHAT_RELAY_PORT);
+    printf("[VRCHAT] inject: зоны vrchat.com/vrchat.cloud -> 127.0.0.1:%d\n",
+           VRCHAT_DNS_PORT);
+    printf("[VRCHAT]   relay=%s\n", opt_use_relay ? "on" : "off");
     for (int i = 0; vrchat_notable[i]; i++) {
         const char *ip = lookup_ip(vrchat_notable[i]);
         printf("[VRCHAT]   %s -> %s\n", vrchat_notable[i], ip ? ip : "?");
     }
 
-    // TLS redirect to the SNI-split relay for every pinned address.
-    char seen[32][64];
-    int nseen = 0;
-    for (int i = 0; vrchat_pins[i].domain; i++) {
-        const char *ip = vrchat_pins[i].ip;
-        int dup = 0;
-        for (int j = 0; j < nseen; j++) dup |= (strcmp(seen[j], ip) == 0);
-        if (!dup && nseen < 32) {
-            snprintf(seen[nseen], sizeof(seen[0]), "%s", ip);
-            nseen++;
-        }
-    }
-    for (int i = 0; i < nseen; i++)
-        iptables_add_redirect(seen[i]);
-
-    sni_relay_config_t rc = {
-        .port = VRCHAT_RELAY_PORT,
-        .so_mark = VRCHAT_SO_MARK,
-        .frag_delay_ms = 30,
-        .frag_first_seg = 20,
-        .primary_dns = ctx.primary,
-        .fallback_dns = ctx.fallback,
-    };
-    if (sni_relay_start(&rc) != 0) {
-        fprintf(stderr, "[VRCHAT] relay start failed: %s\n", strerror(errno));
-        iptables_del_rules();
-        responder_stop();
-        ctx.mode = 0;
-        return;
-    }
-    printf("[VRCHAT]   SNI-split relay: 127.0.0.1:%d (pid %d)\n",
-           VRCHAT_RELAY_PORT, sni_relay_pid());
-
     ctx.mode = 1;
+    if (opt_use_relay) {
+        // Редиректим 443 пинованных адресов в собственный релей модуля.
+        char seen[32][64];
+        int nseen = 0;
+        for (int i = 0; vrchat_pins[i].domain; i++) {
+            const char *ip = vrchat_pins[i].ip;
+            int dup = 0;
+            for (int j = 0; j < nseen; j++) dup |= (strcmp(seen[j], ip) == 0);
+            if (!dup && nseen < 32) {
+                snprintf(seen[nseen], sizeof(seen[0]), "%s", ip);
+                nseen++;
+            }
+        }
+        for (int i = 0; i < nseen; i++)
+            iptables_add_redirect(seen[i]);
+
+        plain_relay_config_t rc = {
+            .port = VRCHAT_RELAY_PORT,
+            .so_mark = VRCHAT_SO_MARK,
+            .chunk = opt_relay_chunk,
+            .pause_ms = opt_relay_pause_ms,
+            .idle_sec = opt_relay_idle_sec,
+        };
+        if (plain_relay_start(&rc) != 0) {
+            fprintf(stderr, "[VRCHAT] relay start failed: %s\n", strerror(errno));
+            iptables_del_rules();
+            responder_stop();
+            ctx.mode = 0;
+            return;
+        }
+        printf("[VRCHAT]   relay: 127.0.0.1:%d (pid %d, chunk=%d pause=%dms idle=%ds)\n",
+               VRCHAT_RELAY_PORT, plain_relay_pid(),
+               opt_relay_chunk, opt_relay_pause_ms, opt_relay_idle_sec);
+    } else {
+        printf("[VRCHAT]   relay off: трафик идёт напрямую на пинованные адреса\n");
+    }
+
     printf("[VRCHAT] inject done (responder pid %d, %s)\n",
            (int)responder_pid,
            is_root() ? "iptables active" : "no root — iptables skipped");
@@ -484,7 +631,7 @@ void vrchat_module_remove(void) {
     if (!vrchat_initialized) return;
     iptables_del_rules();
     responder_stop();
-    sni_relay_stop();
+    plain_relay_stop();
     ctx.mode = 0;
     printf("[VRCHAT] remove done\n");
 }
@@ -492,6 +639,8 @@ void vrchat_module_remove(void) {
 const char *vrchat_get_status(void) {
     if (!vrchat_initialized) return "Off";
     if (!ctx.mode) return "Idle";
-    if (responder_pid <= 0 || !sni_relay_running()) return "Active (relay down!)";
-    return "Active (SNI-split relay)";
+    if (responder_pid <= 0) return "Active (responder down!)";
+    if (!opt_use_relay) return "Active (DNS pinning)";
+    if (!plain_relay_running()) return "Active (relay down!)";
+    return "Active (relay)";
 }

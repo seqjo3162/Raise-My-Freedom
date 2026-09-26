@@ -43,9 +43,8 @@ extern int discord_build_fragmented_ch(const unsigned char* hs, int hs_len,
                                        unsigned char* out, int out_cap,
                                        int* first_seg_out);
 
-// Прозрачный relay с SNI-split (fork-процесс)
-extern int  discord_relay_start(int port);
-extern void discord_relay_stop(void);
-extern int  discord_relay_running(void);
+// Свой релей (SNI-split) удалён: модуль использует общий
+// src/common/plain_relay.c, который не меняет TLS. Раньше здесь был
+// fork-релей с разрывом SNI — он рвал крупные ответы Cloudflare.
 
 #endif // DISCORD_MODULE_H
