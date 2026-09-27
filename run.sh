@@ -39,19 +39,24 @@ SAVE_KEEP=5
 # заворачивают запросы в ядро) он не выдерживает — резолв начинает отдавать
 # таймауты и пропадает интернет целиком. Проверено: 4 модуля — резолв 0.0 с,
 # 17 модулей — таймауты. Остальные включай по необходимости:
-#   ./run.sh start google github vrchat spotify twitch steam
-DEFAULT_PLUGINS=(vrchat google github)
+#   ./run.sh start google github hf vrchat reddit spotify twitch
+DEFAULT_PLUGINS=(vrchat google github hf discord)
 
 # Цепочки rmf в таблице nat. Список один — его используют и flush, и stop.
 RMF_CHAINS=(
-  GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS
+  GITHUB_BYPASS DISCORD_BYPASS DISCORD_QUIC VRCHAT_BYPASS GOOGLE_YT_BYPASS
   NINEGAG_BYPASS NETFLIX_BYPASS REDDIT_BYPASS SPOTIFY_BYPASS
   TWITCH_BYPASS VK_BYPASS ROBLOX_BYPASS STEAM_BYPASS ACTIVISION_BYPASS
   BATTLENET_BYPASS EPICGAMES_BYPASS HF_BYPASS RMF_DNS
 )
 
-# Владелец файлов, которые скрипт создаёт: sudo -u $SUDO_USER, иначе текущий.
-OWNER="${SUDO_USER:-$(id -un)}"
+# Владелец файлов, которые скрипт создаёт.
+#
+# Раньше было SUDO_USER:-id -un, но при вызове из systemd (сторож) SUDO_USER
+# пуст, а id -un отдаёт root — fix_owner chown'ил на root и ничего не чинил,
+# из-за чего build/ оставался под root и следующая сборка падала.
+# Владелец каталога проекта известен и не зависит от способа вызова.
+OWNER="${SUDO_USER:-$(stat -c %U "$ROOT_DIR" 2>/dev/null || id -un)}"
 OWNER_GROUP="$(id -gn "$OWNER" 2>/dev/null || echo root)"
 
 c_reset=$'\033[0m'; c_ok=$'\033[0;32m'; c_err=$'\033[0;31m'; c_dim=$'\033[2m'
@@ -78,12 +83,12 @@ need_root() {
 
 # chown всего, что создаёт скрипт, на пользователя-инициатора
 fix_owner() {
-  for d in "$ROOT_DIR/build" "$LOG_DIR" "$ROOT_DIR/webui"; do
+  for d in "$ROOT_DIR/build" "$LOG_DIR" "$ROOT_DIR/webui" "$ROOT_DIR/cache"; do
     [ -e "$d" ] && chown -R "$OWNER:$OWNER_GROUP" "$d" 2>/dev/null || true
   done
 }
 
-# Мусор от старой сборки (minizapret) и старые логи. Идемпотентно.
+# Мусор от старой сборки и старые логи. Идемпотентно.
 # .xo модулей, которых больше нет в Makefile. Сборка их не трогает, и веб
 # продолжает показывать удалённый модуль в списке — он удалялся, а плагин
 # оставался. custom.xo в исключении: его собирает конструктор.
@@ -109,9 +114,8 @@ prune_plugins() {
 clean_legacy() {
   rm -rf "$ROOT_DIR/build.deploy" 2>/dev/null || true
   rmdir "$ROOT_DIR/backups" 2>/dev/null || true
-  rm -f  "$BIN_DIR/minizapret" "$BIN_DIR/minizapret-web" 2>/dev/null || true
   prune_plugins
-  rm -f  "$LOG_DIR/minizapret-web.log" "$LOG_DIR/rmf.pid" "$LOG_DIR/rmf.log" \
+  rm -f  "$LOG_DIR/rmf.pid" "$LOG_DIR/rmf.log" \
          "$LOG_DIR/rmf-web.log" "$LOG_DIR/iptables-before-cleanup.rules" 2>/dev/null || true
 }
 
@@ -148,6 +152,24 @@ drop_chains() {
   done < <(iptables -t nat -S 2>/dev/null \
     | sed -n 's/^-N \([A-Za-z0-9_]*\)$/\1/p' \
     | grep -E '_BYPASS$|^RMF_DNS$')
+
+  # Тот же список в filter. Нужен для DISCORD_QUIC: модуль discord держит
+  # в filter собственную цепочку с REJECT на udp/443, и без этого прохода
+  # run.sh stop оставлял её висеть. Остальные имена в filter не существуют,
+  # -F/-X на них молча ничего не делают.
+  for ch in "${RMF_CHAINS[@]}"; do
+    iptables -t filter -D OUTPUT -j "$ch" 2>/dev/null || true
+    iptables -t filter -F "$ch" 2>/dev/null || true
+    iptables -t filter -X "$ch" 2>/dev/null || true
+  done
+  while read -r line; do
+    [ -n "$line" ] || continue
+    iptables -t filter -D OUTPUT -j "$line" 2>/dev/null || true
+    iptables -t filter -F "$line" 2>/dev/null || true
+    iptables -t filter -X "$line" 2>/dev/null || true
+  done < <(iptables -t filter -S 2>/dev/null \
+    | sed -n 's/^-N \([A-Za-z0-9_]*\)$/\1/p' \
+    | grep -E '_BYPASS$|_QUIC$|^RMF_DNS$')
 }
 
 # Правила модулей в таблице filter живут прямо в OUTPUT, а не в цепочке rmf,
@@ -250,7 +272,9 @@ restore_state() {
 build() {
   save_state
   step "сборка (make core plugs webui)..."
-  make -C "$ROOT_DIR" -j1 core plugs webui >/dev/null
+  # set -e вышел бы из функции на неудаче make, и fix_owner не выполнился бы —
+  # build/ остался бы под root, и следующая сборка упала бы уже на нём.
+  make -C "$ROOT_DIR" -j1 core plugs webui >/dev/null || true
   fix_owner
 }
 
@@ -268,9 +292,14 @@ start() {
   local plugins=("$@")
   [ ${#plugins[@]} -eq 0 ] && plugins=("${DEFAULT_PLUGINS[@]}")
 
-  clean_legacy
-  save_state
-  stop_all
+    clean_legacy
+    save_state
+    stop_all
+    # После жёсткого обрушения компьютера процессы не успели снять свои
+    # цепочки iptables, и они остаются в системе до перезагрузки. Модуль,
+    # стартующий поверх, может на них наткнуться. stop_all тут не помогает:
+    # снимать нечего, процессов уже нет. Поэтому чистим принудительно.
+    drop_chains >/dev/null 2>&1 || true
   need_build && build
   [ -x "$WEB_BIN" ] || die "нет $WEB_BIN — запусти: ./run.sh build"
 
@@ -282,14 +311,28 @@ start() {
   wait_for 30 web_up || { tail -n 20 "$WEB_LOG" >&2; die "веб не поднялся, смотри $WEB_LOG"; }
   ok "веб:    $API"
 
-  local p
-  for p in "${plugins[@]}"; do
-    if api -X POST "$API/api/start?plugin=$p" >/dev/null; then
-      ok "плагин: $p"
-    else
-      printf '  %s%s не стартовал%s\n' "$c_err" "$p" "$c_reset"
-    fi
-  done
+    local p
+    local started=()
+    for p in "${plugins[@]}"; do
+      if api -X POST "$API/api/start?plugin=$p" >/dev/null; then
+        ok "плагин: $p"
+        started+=("$p")
+      else
+        printf '  %s%s не стартовал%s\n' "$c_err" "$p" "$c_reset"
+      fi
+    done
+
+    # Записываем, какие модули должны работать. Раньше этот список знал только
+    # run.sh, и он сразу выходил, а сторож проверял исключительно веб. В
+    # результате умерший модуль оставался незамеченным: его правила iptables
+    # продолжали уводить трафик приложения в рель, которого уже нет, и
+    # приложение получало «В соединении отказано». Веб при этом отвечал, так
+    # что сторож был уверен, что всё в порядке.
+    local state_dir=/run/rmf
+    mkdir -p "$state_dir" 2>/dev/null || state_dir="$ROOT_DIR/cache"
+    printf '%s\n' "${started[@]:-}" >"$state_dir/expected-plugins" 2>/dev/null \
+      || printf '%s\n' "${started[@]:-}" >"$ROOT_DIR/cache/expected-plugins" 2>/dev/null || true
+
 
   wait_for 20 bash -c "curl -fsS -m 3 $API/api/status | grep -q '\"proxy\":true'" \
     || die "прокси не поднялся, смотри $WEB_LOG"

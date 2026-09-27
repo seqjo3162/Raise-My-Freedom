@@ -93,6 +93,22 @@ code{background:#0d1117;border:1px solid #21262d;padding:1px 5px;border-radius:3
   </table>
 </div>
 
+<!-- Если скрипт не выполнился (например, браузер отдал закешированную
+     версию), таблица навсегда остаётся с «loading...» и выглядит как
+     пустая. Через пару секунд показываем это прямо, вместо тишины. -->
+<script>
+setTimeout(function(){
+  var b=document.getElementById('rows');
+  if(!b||b.children.length===0||/loading/i.test(b.textContent)){
+    b.innerHTML='<tr><td colspan="4" style="color:#d29922;line-height:1.7">'
+      +'Скрипт интерфейса не загрузился.<br>'
+      +'Обнови страницу с очисткой кэша: <b>Ctrl+Shift+R</b> (в Firefox — <b>Ctrl+F5</b>).<br>'
+      +'Если не помогло — открой консоль (F12) и пришли ошибку.'
+      +'</td></tr>';
+  }
+},2500);
+</script>
+
 <!-- ══════════ Telegram / MTProxy ══════════ -->
 <div class="tabpage" id="page-telegram">
   <div class="panel">
@@ -228,21 +244,21 @@ const BYPASS = {
   discord:'SNI-split relay + DNS pinning',vrchat:'DNS pinning + iptables DNAT',
   telegram:'MTProxy (WebSocket + SNI-fake-TLS)',x:'SNI-split relay + DoH/DNS pinning',
   github:'DoH-резолв против подмены DNS',
-  google:'DNS bypass',
-  twitch:'',spotify:'',
-  steam:'',epicgames:'',roblox:'',cloudflaredns:'',
-  battlenet:'',activision:'',telegram:'',discord:'',github:'',vrchat:'',
-  electronicarts:'',soundcloud:'',speedtestbyookla:''
+  universal:'роутер DNS-прокси',google:'DNS bypass',
+  hf:'',vk:'',reddit:'',twitch:'',spotify:'',netflix:'',
+  steam:'','9gag':'',epicgames:'',roblox:'',cloudflaredns:'',
+  battlenet:'',activision:''
 };
 
 // Отображаемые имена модулей. Без этой карты renderTable падал с
 // ReferenceError, и список оставался пустым без всякой ошибки на экране.
 const NAMES = {
-  activision:'Activision', battlenet:'Battlenet', cloudflaredns:'Cloudflare DNS',
-  discord:'Discord', electronicarts:'EA App', epicgames:'Epic Games',
-  github:'GitHub', google:'Google', roblox:'Roblox', soundcloud:'SoundCloud',
-  speedtestbyookla:'Speedtest', spotify:'Spotify', steam:'Steam',
-  telegram:'Telegram', twitch:'Twitch', vrchat:'VRChat', x:'X.com'
+  '9gag':'9GAG', activision:'Activision', battlenet:'Battlenet',
+  cloudflaredns:'Cloudflare DNS', discord:'Discord', epicgames:'Epic Games',
+  google:'Google', github:'GitHub', hf:'Hugging Face', netflix:'Netflix',
+  reddit:'Reddit', roblox:'Roblox', spotify:'Spotify', steam:'Steam',
+  telegram:'Telegram', twitch:'Twitch', universal:'Universal', vk:'VK',
+  vrchat:'VRChat'
 };
 
 let allPlugins=[], statusData={proxy:false,plugins:[]};

@@ -76,6 +76,21 @@ static int domain_matches(const char *query, const char *base) {
 }
 
 static const char *lookup_pin(const char *domain) {
+    // Сначала точное совпадение, и только потом — по суффиксу.
+    //
+    // Порядок важен. Закрепление зоны нужно, чтобы один адрес покрывал её
+    // поддомены: у VRChat это api, pipeline, www. Но если у поддомена есть
+    // собственный адрес, суффиксный не должен его забивать. Иначе
+    // cdn-lfs-eu-1.hf.co получал адрес hf.co, стоявший в списке раньше, и
+    // отдавал чужой сертификат: у HF это разные сервисы за разными адресами.
+    // Наблюдалось прямо: в файле стояло
+    //   hf.co                    34.198.14.237
+    //   cdn-lfs-eu-1.hf.co       13.249.8.45
+    // а DNS для cdn-lfs-eu-1.hf.co отдавал 34.198.14.237 — первое совпадение
+    // по суффиксу, собственный адрес проигнорирован.
+    if (!domain) return NULL;
+    for (int i = 0; i < site_pin_count; i++)
+        if (strcasecmp(domain, site_pins[i].domain) == 0) return site_pins[i].ip;
     for (int i = 0; i < site_pin_count; i++)
         if (domain_matches(domain, site_pins[i].domain)) return site_pins[i].ip;
     return NULL;
@@ -103,7 +118,25 @@ static int site_doctor(const site_bypass_config_t *config) {
                    config->name, site_pins[i].domain, ip);
             continue;
         }
-        if (tested < PROBE_MAX_IPS) {
+        // Проверяем имя в сертификате. Без этого адрес, перешедший к другому
+        // владельцу, выглядит живым: на TCP отвечает, TLS завершает, и все
+        // прежние проверки считают его годным. Именно так в закреплениях
+        // Hugging Face остался адрес Amazon'а вместо huggingface.co, и CDN
+        // файлов отдавал мусор вместо моделей.
+        //
+        // Три исхода различаются сами по себе, допрашивать сервер не нужно:
+        //   1 — сертификат выдан этому имени: адрес верный;
+        //   0 — рукопожато��ь состоялось, а имя в сертификате чужое: адрес
+        //       достался постороннему, выбрасываем;
+        //  -1 — рукопожатие не состоялось: домен режут по имени, адрес верный,
+        //       и он нужен как раз для рельа с разрывом SNI.
+        int cert = site_probe_cert_ok(ip, site_pins[i].domain, PROBE_TIMEOUT_MS);
+        if (cert == 0) {
+            printf("[%s] %s -> %s: сертификат выдан другому имени, "
+                   "адрес выброшен\n", config->name, site_pins[i].domain, ip);
+            continue;
+        }
+        if (tested < PROBE_MAX_IPS && cert == 1) {
             // Проверяем дважды: блокировка у провайдера меняется во времени, и по
             // одной удачной пробе доктор снимал рель у домена, который через
             // минуту снова оказывался зарезанным. Два подряд «вижу» — верим;
@@ -118,9 +151,22 @@ static int site_doctor(const site_bypass_config_t *config) {
     }
 
     if (kept == 0) {
-        printf("[%s] ни один адрес не отвечает — сайт недоступен из этой сети, "
-               "рель не поможет\n", config->name);
-        return -1;
+        if (site_pin_count > 0) {
+            // Были закрепления, и все оказались чужими. Считать сайт
+            // недоступным нельзя: сбрасываем закрепления, чтобы домен
+            // перерезолвился заново через DoH. Так чинится Hugging Face после
+            // того, как закреплённый адрес перешёл к Amazon'у.
+            printf("[%s] все %d закреплений не прошли проверку, "
+                   "перерезолвиваю заново\n", config->name, site_pin_count);
+            site_pin_count = 0;
+            memset(site_pins, 0, sizeof(site_pins));
+            silent = 0;
+            tested = 0;
+        } else {
+            printf("[%s] ни один адрес не отвечает — сайт недоступен из этой "
+                   "сети, рель не поможет\n", config->name);
+            return -1;
+        }
     }
     if (kept != site_pin_count)
         printf("[%s] закреплений осталось %d из %d\n", config->name, kept, site_pin_count);
@@ -443,7 +489,7 @@ static const char *prev_pin_for(const char *domain) {
 }
 
 static void pins_save(const char *name) {
-    if (!name || !name[0] || site_pin_count <= 0) return;
+    if (!name || !name[0]) return;
     mkdir("/run/rmf", 0755);
     mkdir("/run/rmf/pins", 0755);
     char path[512], tmp[560];
@@ -451,6 +497,11 @@ static void pins_save(const char *name) {
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
+    // Писать пустой файл тоже нужно. Раньше здесь стоял ранний выход при
+    // site_pin_count == 0, и когда доктор отбрасывал все закрепления, старый
+    // файл оставался на диске как есть. Следующий запуск грузил его обратно и
+    // получал те же неверные адреса — то есть вылечить адрес, ушедший к
+    // другому владельцу, было невозможно. Именно так застрял Hugging Face.
     for (int i = 0; i < site_pin_count; i++)
         fprintf(f, "%s %s\n", site_pins[i].domain, site_pins[i].ip);
     fclose(f);
@@ -473,6 +524,13 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
     state->dns_port = config->dns_port;
     state->relay_port = config->relay_port;
     state->mark = config->mark;
+    // Помечаем сокеты проверок, чтобы они не попадали в собственные
+    // REDIRECT-правила модуля. Без этого доктор измеряет собственный рель, а
+    // не провайдера: закреплённый адрес проверяется через рель, тот отвечает
+    // с задержкой на разрыве SNI, проба упирается в таймаут и выглядит как
+    // «домен недоступен». Раньше метку ставили только discord и vrchat, а все
+    // остальные site-модули мерили сами себя.
+    site_probe_set_mark((unsigned int)state->mark);
     state->dns_fd = -1;
     pins_load(config->name);
     site_pin_count = 0;
@@ -502,45 +560,114 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
             goto pin_ready;
         }
 
-        // Прошлый адрес этого домена, если он ещё отвечает, оставляем: так
-        // набор серверов не прыгает при каждом перезапуске модуля.
+        // Прошлый адрес этого домена оставляем только если он и дальше отдаёт
+        // сертификат именно этого имени: так набор серверов не прыгает при
+        // каждом перезапуске модуля.
+        //
+        // Проверки одного TCP мало. Адрес CloudFront принимает соединение и
+        // при этом обрывает TLS, то есть на проверку «доходит ли» отвечает,
+        // а сертификат не отдаёт. Такое закрепление держалось вечно: путь
+        // ниже, с перебором кандидатов и сверкой сертификата, до него просто
+        // не доходил. Наблюдалось на transfer.xethub.hf.co: закреплён был
+        // 143.204.238.109, который отвечает на TCP и молчит на TLS, тогда как
+        // 143.204.238.52 из того же ответа DoH отдаёт верный сертификат.
+        //
+        // Строгое условие (только верный сертификат) стоит нескольких лишних
+        // проб при старте для заблокированных доменов, но даёт верный выбор:
+        // для них перебор кандидатов ниже всё равно заканчивается запасным
+        // закрытым адресом, то есть результат тот же.
         const char *prev = prev_pin_for(domain);
         if (prev && site_ip_allowed(prev) &&
-            site_probe_tcp(prev, 443, PROBE_TIMEOUT_MS)) {
-            snprintf(ip, sizeof(ip), "%s", prev);
+            site_probe_tcp(prev, 443, PROBE_TIMEOUT_MS) &&
+            site_probe_cert_ok(prev, domain, PROBE_TIMEOUT_MS) == 1) {
+            snprintf(ip, sizeof(ip), "%.*s", (int)sizeof(ip) - 1, prev);
             goto pin_ready;
         }
 
-        // Кандидаты: все A-записи от DoH, затем обычный DNS, затем запасные
-        // адреса модуля. Берём первый, до которого доходит TCP: раньше
-        // брался первый попавшийся, и если он недостижим — терялся весь домен.
+        // Кандидаты: сначала все A-записи от DoH, затем обязательно обычный
+        // DNS, затем запасные адреса модуля. Берём первый, до которого доходит
+        // TCP: раньше брался первый попавшийся, и если он недостижим — терялся
+        // весь домен.
+        //
+        // Обычный DNS добавляется всегда, а не только когда DoH не ответил.
+        // Разные резолверы дают для одного домена разные адреса, и у них может
+        // быть разная доступность. Для github.com Cloudflare отдаёт
+        // 4.225.11.194, а 8.8.8.8 и 9.9.9.9 — 140.82.121.3, который у
+        // провайдера режется. Раньше при сбое DoH домен целиком уезжал на
+        // этот заблокированный адрес и висел, хотя рабочий рядом был. Со
+        // сбором обоих источников проба просто находит живой.
         char cands[8][64];
         int ncand = 0;
         doh_resolve_a_multi(domain, cands, 8, &ncand);
-        if (ncand == 0) {
-            if (dns_resolve_udp(state->primary, domain, ip, sizeof(ip)) == 0)
-                snprintf(cands[ncand++], 64, "%.*s", 63, ip);
-            else if (dns_resolve_udp(state->fallback, domain, ip, sizeof(ip)) == 0)
-                snprintf(cands[ncand++], 64, "%.*s", 63, ip);
+        if (ncand < 8) {
+            char one[64];
+            if (dns_resolve_udp(state->primary, domain, one, sizeof(one)) == 0) {
+                int dup = 0;
+                for (int i = 0; i < ncand; i++)
+                    if (strcmp(cands[i], one) == 0) { dup = 1; break; }
+                if (!dup) snprintf(cands[ncand++], 64, "%.*s", 63, one);
+            }
+        }
+        if (ncand < 8) {
+            char one[64];
+            if (dns_resolve_udp(state->fallback, domain, one, sizeof(one)) == 0) {
+                int dup = 0;
+                for (int i = 0; i < ncand; i++)
+                    if (strcmp(cands[i], one) == 0) { dup = 1; break; }
+                if (!dup) snprintf(cands[ncand++], 64, "%.*s", 63, one);
+            }
         }
         for (size_t j = 0; j < site_fallback_count && ncand < 8; j++)
-            if (site_fallback_ips[j]) snprintf(cands[ncand++], 64, "%.*s", 63, site_fallback_ips[j]);
+            if (site_fallback_ips[j])
+                snprintf(cands[ncand++], 64, "%.*s", 63, site_fallback_ips[j]);
 
         ip[0] = '\0';
+        char blocked[64] = {0};
         int tried = 0;
         for (int c = 0; c < ncand; c++) {
             if (!site_ip_allowed(cands[c])) continue;
             tried++;
             if (site_probe_tcp(cands[c], 443, PROBE_TIMEOUT_MS)) {
-                // Ограниченная копия: cands[c] — элемент массива, и без
-                // предела gcc считает источник потенциально выходщим.
-                snprintf(ip, sizeof(ip), "%.*s", (int)sizeof(ip) - 1, cands[c]);
-                break;
+                // TCP отвечает — этого мало. CloudFront обслуживает на одном
+                // адресе сразу много доменов и по SNI отдаёт сертификат того
+                // домена, который попался первым. Поэтому адрес, годный для
+                // hf.co, проходил проверку TCP и тут же закреплялся за
+                // huggingface.co, cdn-lfs и cdn-oauth, а те получали чужой
+                // сертификат и не грузились. Сверяем имя: 0 — сертификат
+                // чужой, такой адрес для этого домена не годится; -1 — рукопо-
+                // жатие не состоялось, домен режут по имени, адрес оставляем
+                // (для него и нужен рель).
+                int cert = site_probe_cert_ok(cands[c], domain, PROBE_TIMEOUT_MS);
+                if (cert == 0) {
+                    if (config->name)
+                        printf("[%s] %s: %s отдаёт чужой сертификат, пропускаю\n",
+                               config->name, domain, cands[c]);
+                    continue;
+                }
+                if (cert == 1) {
+                    // Ограниченная копия: cands[c] — элемент массива, и без
+                    // предела gcc считает источник потенциально выходщим.
+                    snprintf(ip, sizeof(ip), "%.*s", (int)sizeof(ip) - 1, cands[c]);
+                    break;
+                }
+                // Домен режут по имени. Сохраняем как запасной, но продолжаем
+                // искать лучший: у одного и того же CloudFront часть адресов
+                // закрыта, а часть отвечает. Для transfer.xethub.hf.co из
+                // четырёх адресов два не отвечают и два отдают нужный
+                // сертификат, поэтому первый закрытый нельзя принимать сразу.
+                if (!blocked[0])
+                    snprintf(blocked, sizeof(blocked), "%.*s",
+                             (int)sizeof(blocked) - 1, cands[c]);
+                continue;
             }
             if (config->name)
                 printf("[%s] %s: адрес %s недостижим, пробуем следующий\n",
                        config->name, domain, cands[c]);
         }
+        // Ни одного адреса с верным сертификатом не нашлось — берём закрытый,
+        // для него и нужен рель с разрывом SNI.
+        if (!ip[0] && blocked[0])
+            snprintf(ip, sizeof(ip), "%.*s", (int)sizeof(ip) - 1, blocked);
         if (!site_ip_allowed(ip)) {
             // Одно сообщение на домен с конкретной причиной: раньше их было
             // два подряд и оба неверные, из-за чего вывод путался.

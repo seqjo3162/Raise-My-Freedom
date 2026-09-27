@@ -52,7 +52,14 @@ int nf_udp_deny(const char *chain, const char *dest, int dport);
 // Перехват DNS. С доменом — правило по имени (--hex-string), без домена —
 // перехват всего UDP/53. Второе опасно для всей системы и должно
 // использоваться осознанно.
+#include <stddef.h>
 int nf_dns_redirect(const char *chain, const char *domain, int to_port);
+
+// Шаблон домена в виде hex для -m string --hex-string: "|0764697363...|".
+// Вынесено наружу, чтобы свойство «в правило идут только hex-символы» можно
+// было проверить тестом: сырые байты длины лейбла через system() ломали
+// команду на доменах с длиной 34/36/39 (0x22, 0x24, 0x27).
+int nf_wire_hex_pattern(const char *domain, char *out, size_t out_size);
 int nf_dns_redirect_all(const char *chain, int to_port);
 
 // Удалить все цепочки, созданные через nf_chain_create. Список ведётся в

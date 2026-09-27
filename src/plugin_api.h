@@ -32,9 +32,7 @@ static inline const char *plugin_canonical_name(const char *name) {
         {"xcom", "x"},
         {"twitter", "x"},
         {"robloxcom", "roblox"},
-        {"soundcloudcom", "soundcloud"},
         {"cloudflayerdnscom", "cloudflaredns"},
-        {"speedtestnet", "speedtestbyookla"}
     };
 
     if (!name) return "";

@@ -24,18 +24,26 @@ typedef struct {
     // означать исходные значения, иначе модули, которые эти поля не задают,
     // молча поменяют своё поведение.
     int no_split_client_hello;  // 1 = отправить ClientHello как есть, без разрыва SNI
+    // Смена регистра первой буквы SNI: длина записи не меняется, поток к
+    // Cloudflare остаётся целым. Разрыв SNI ломает поток примерно на 16 КБ.
+    int shift_sni;
     int data_chunk;             // размер порции при пересылке данных, 0 = 4096
     int data_pause_ms;          // пауза между порциями, 0 = 1 мс, отрицательное = без паузы
     // 1 = не резать ответные handshake-записи (0x16) пополам. Проверено: при
     // разрезе клиент получал ответ и отвечал алертом (ERR_SSL_PROTOCOL_ERROR).
     // Поле по умолчанию 0, то есть прежнее поведение.
     int no_split_handshake_records;
+    // На сколько записей дробить ClientHello. 0 и 2 — прежнее поведение
+    // (две половины). 3 и больше — multisplit из zapret: чем больше границ,
+    // тем труднее DPI собрать поток обратно.
+    int multi_parts;
 } sni_relay_config_t;
 
 // Start relay in a forked child. Returns 0 on success, -1 on error.
 // Only one relay per process (static state).
 int sni_relay_start(const sni_relay_config_t *cfg);
 void sni_relay_stop(void);
+void sni_relay_prefer(const char *ip);   // вызывать ДО sni_relay_start
 int sni_relay_running(void);
 int sni_relay_pid(void);
 

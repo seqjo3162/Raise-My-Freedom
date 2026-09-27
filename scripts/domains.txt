@@ -1,0 +1,7 @@
+# Список для scripts/analyze-all.sh. Формат: модуль|домен[,домен...]
+# Первый домен в строке — тот, по которому скрипт судит о доступности.
+# Домены выписаны из исходников модулей, чтобы список не расходился с кодом.
+
+discord|discord.com,cdn.discordapp.net,media.discordapp.net,api.discord.com
+telegram|web.telegram.org,d-1.web.telegram.org
+vrchat|vrchat.com,api.vrchat.cloud

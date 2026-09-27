@@ -19,9 +19,21 @@ static void on_signal(int sig) { (void)sig; s_running = 0; }
 
 static int plugin_status_failed(const char *status) {
     if (!status) return 0;
-    return strstr(status, "down") || strstr(status, "Inactive") ||
-           strstr(status, "Unavailable") || strstr(status, "failed") ||
-           strstr(status, "Idle") || strstr(status, "Not loaded") ||
+    // Статус, который начинается со слова Active, — это по определению «модуль
+    // считает себя работающим». Раньше проверка искала подстроки по всему
+    // тексту, и Discord со строкой "Active (relay down!)" попадал в отказ:
+    // слово down внутри скобок перевешивало слово Active в начале. Хост
+    // выходил, а вместе с ним умирал рель, и модуль падал по кругу.
+    //
+    // Что в скобках — предупреждение для человека, а не вердикт. Вердикт
+    // выносим наружу явными строками: модуль, который считает, что не
+    // работает, обязан вернуть Off или Unavailable.
+    if (strncmp(status, "Active", 6) == 0) return 0;
+    return strstr(status, "Inactive") ||
+           strstr(status, "Unavailable") ||
+           strstr(status, "failed") ||
+           strstr(status, "Idle") ||
+           strstr(status, "Not loaded") ||
            strcmp(status, "Off") == 0;
 }
 
@@ -263,7 +275,7 @@ int main(int argc, char **argv) {
         while (*mod == '-') mod++;
 
         const char *old_chains[] = {
-            "GITHUB_BYPASS", "DISCORD_BYPASS", "VRCHAT_BYPASS", "GOOGLE_YT_BYPASS",
+            "GITHUB_BYPASS", "DISCORD_BYPASS", "DISCORD_QUIC", "VRCHAT_BYPASS", "GOOGLE_YT_BYPASS",
             "XCOM_BYPASS", "SPEEDTEST_BYPASS", "JINXXY_BYPASS",
             "RMF_DNS", "NINEGAG_BYPASS", "INSTAGRAM_BYPASS",
             "MYJELLYFIN_BYPASS", "NETFLIX_BYPASS", "REDDIT_BYPASS",

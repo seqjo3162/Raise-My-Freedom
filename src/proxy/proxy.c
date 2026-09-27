@@ -168,6 +168,41 @@ static int build_a_resp(const unsigned char *q, int ql, unsigned char *buf, int 
     return o;
 }
 
+// Ответ с несколькими A-записями. build_a_resp жёстко пишет ANCOUNT=1, поэтому
+// домен с несколькими адресами (например за CloudFront) отдавался клиенту одним
+// адресом: если он не отвечает, домен недоступен целиком и ретрая нет.
+// Клиент сам выберет живой, плюс вернутся настоящие TTL.
+static int build_a_resp_multi(const unsigned char *q, int ql, unsigned char *buf, int buflen,
+                              char ips[][64], int count) {
+    int qpos = skip_qname(q, ql);
+    int qsection_len = qpos + 4;
+    if (qsection_len > ql || count <= 0 || count > 8) return -1;
+    if (buflen < qsection_len + 16 * count) return -1;
+    memset(buf, 0, buflen);
+    memcpy(buf, q, qsection_len);
+    unsigned char *r = buf;
+    r[2] = 0x81; r[3] = 0x80;
+    r[8] = 0; r[9] = 0;
+    r[10] = 0; r[11] = 0;
+    int o = qsection_len;
+    for (int i = 0; i < count; i++) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, ips[i], &a) != 1) continue;
+        r[o++] = 0xC0; r[o++] = 0x0C;   // имя = указатель на вопрос
+        r[o++] = 0x00; r[o++] = 0x01;   // type A
+        r[o++] = 0x00; r[o++] = 0x01;   // class IN
+        r[o++] = 0x00; r[o++] = 0x00; r[o++] = 0x00; r[o++] = 0x78; // TTL 120
+        r[o++] = 0x00; r[o++] = 0x04;   // rdlength
+        memcpy(r + o, &a, 4);
+        o += 4;
+    }
+    int emitted = (o - qsection_len) / 16; // inet_pton мог отсеять часть адресов
+    if (emitted <= 0) return -1;
+    r[6] = (unsigned char)(emitted >> 8);
+    r[7] = (unsigned char)(emitted & 0xFF);
+    return o;
+}
+
 static int forward_q(const unsigned char *q, int ql, unsigned char *ans, int anslen, const char *up) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
@@ -274,9 +309,10 @@ int run_proxy(int argc, char **argv) {
                 if (getppid() == 1) _exit(0);
                 int rl = -1;
                 if (qtype == 1) {
-                    char doh_ip[64] = {0};
-                    if (doh_resolve_a(dom, doh_ip, sizeof(doh_ip)) == 0)
-                        rl = build_a_resp(qbuf, (int)n, rbuf, sizeof(rbuf), doh_ip);
+                    char cands[8][64];
+                    int nc = 0;
+                    if (doh_resolve_a_multi(dom, cands, 8, &nc) == 0 && nc > 0)
+                        rl = build_a_resp_multi(qbuf, (int)n, rbuf, sizeof(rbuf), cands, nc);
                 }
                 if (rl <= 0) rl = forward_q(qbuf, (int)n, rbuf, sizeof(rbuf), up);
                 if (rl <= 0) rl = forward_q(qbuf, (int)n, rbuf, sizeof(rbuf), fb);

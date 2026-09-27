@@ -101,8 +101,8 @@ static void registry_remove(const char *chain) {
 
 // iptables ждёт hex-шаблон в вертикальных чертах: "|0C686F...|". Без них
 // правило молча не добавляется.
-static int wire_hex_pattern(const char *domain, char *out, size_t out_size) {
-    if (!domain || !out || out_size == 0) return -1;
+int nf_wire_hex_pattern(const char *domain, char *out, size_t out_size) {
+    if (!domain || !*domain || !out || out_size == 0) return -1;
     size_t used = 0;
     const char *s = domain;
     while (*s) {
@@ -259,7 +259,7 @@ int nf_udp_deny(const char *chain, const char *dest, int dport) {
 int nf_dns_redirect(const char *chain, const char *domain, int to_port) {
     if (getuid() != 0 || !chain || !domain || !*domain) return -1;
     char hex[1100], pat[1104], cmd[3072], ch[64];
-    if (wire_hex_pattern(domain, hex, sizeof(hex)) < 0) return -1;
+    if (nf_wire_hex_pattern(domain, hex, sizeof(hex)) < 0) return -1;
     bounded(ch, sizeof(ch), chain);
     bounded(pat, sizeof(pat), hex);
     char quoted[1112];

@@ -5,30 +5,31 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 API="http://127.0.0.1:8080"
 
-if ! curl -fsS -m 5 "$API/api/info" >/dev/null 2>&1; then
-    echo "веб не отвечает на $API — сначала sudo ./run.sh start" >&2
-    exit 1
-fi
-
 # Модули на site_bypass — у них есть решение доктора. У остальных своя логика.
-# Списки не пересекаются и вместе покрывают все 17 модулей сборки: раньше
-# google и vrchat попадали в оба, а x, soundcloud, speedtestbyookla и
-# electronicarts не попадали ни в один, и доктор молча их пропускал.
-TEMPLATE="activision battlenet electronicarts epicgames github roblox soundcloud spotify steam twitch"
-OWN="cloudflaredns discord google speedtestbyookla telegram vrchat x"
+TEMPLATE="9gag activision battlenet epicgames github hf netflix reddit roblox spotify steam twitch vk"
+OWN="cloudflaredns discord google telegram vrchat"
 
-# Решение доктора отдаёт сам веб обычным текстом — парсить JSON не нужно.
 verdict_of() {  # verdict_of <метка>
-    local label="$1" out=""
-    for _ in 1 2 3; do
-        out="$(curl -fsS -m 5 "$API/api/verdict?plugin=$label" 2>/dev/null)"
-        case "$out" in
-            ""|"решения пока нет"*) ;;
-            *) break ;;
-        esac
-        sleep 0.4
-    done
-    printf '%s' "$out" | head -1 | cut -c1-70
+  local label="$1" out=""
+  for _ in 1 2 3; do
+    out="$(curl -s -m 5 "http://127.0.0.1:8080/api/logs?limit=400" 2>/dev/null ||
+           curl -s -m 5 "http://127.0.0.1:8080/api/logs?limit=400" 2>/dev/null)" && \
+    out="$(printf '%s' "$out" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+lines=d if isinstance(d,list) else d.get('lines',[])
+for l in lines:
+    t=str(l.get('text') if isinstance(l,dict) else l)
+    if '[$label]' in t and ('проверка SNI' in t or 'домен ' in t or 'адрес выброшен' in t or 'недоступен' in t):
+        print(t.split(']',1)[1].strip())
+" 2>/dev/null)"
+    [ -n "$out" ] && break
+    sleep 0.4
+  done
+  printf '%s' "$out" | head -1 | cut -c1-70
 }
 
 printf '%-16s %-6s %s\n' "модуль" "старт" "решение"

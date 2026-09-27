@@ -221,7 +221,7 @@ int main(void) {
     printf("[TEST] DNS responder\n");
     expect_a("api.vrchat.cloud", "104.18.26.36", 0);      // exact pin
     expect_a("www.vrchat.com", "104.18.6.156", 0);        // exact pin
-    expect_a("files.vrchat.cloud", "3.174.18.93", 0);     // exact pin
+    expect_a("files.vrchat.cloud", "108.157.229.62", 0);     // exact pin
     expect_a("auth.vrchat.cloud", "104.18.26.36", 1);     // suffix zone (login!)
     expect_a("ANYTHING.vrchat.cloud", "104.18.26.36", 1); // unknown subdomain, zone suffix
     expect_a("sub.deep.vrchat.com", "104.18.6.156", 1);   // nested subdomain

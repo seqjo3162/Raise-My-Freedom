@@ -39,6 +39,14 @@
 // Диагностика только по переменной окружения SNI_RELAY_DEBUG=1
 static int g_dbg = -1;
 static volatile sig_atomic_t g_children = 0;
+
+// Уменьшение счётчика живых соединений. В обработчике сигнала разрешено
+// только async-signal-safe вещи: чтение/запись volatile sig_atomic_t —
+// как раз такая. Никаких printf, malloc и waitpid здесь быть не должно.
+static void on_child_exit(int sig) {
+    (void)sig;
+    if (g_children > 0) g_children--;
+}
 static long g_rejected = 0;
 static int dbg_on(void) {
     if (g_dbg < 0) {
@@ -352,9 +360,22 @@ static void handle_conn(int cfd) {
         (unsigned char)orig.sin_addr.s_addr, (unsigned char)(orig.sin_addr.s_addr >> 8),
         (unsigned char)(orig.sin_addr.s_addr >> 16), (unsigned char)(orig.sin_addr.s_addr >> 24),
         ntohs(orig.sin_port), g_split_ch ? "да" : "нет");
+    // CloudFront у VRChat отдаёт контент с четырёх адресов, и провайдер режет
+    // два из них. Раньше на такие адреса соединение просто не устанавливалось,
+    // поэтому новые аватары и миры не грузились. Рель — прозрачная пересылка
+    // байтов, клиенту всё равно, к какому адресу мы стучимся, поэтому идём на
+    // рабочий адрес того же CloudFront. Проверено 2026-09-27: 143.204.238.54
+    // и 108.157.229.98 не проходят, .8 и .62 — проходят.
+    {
+        unsigned char *ip = (unsigned char *)&orig.sin_addr.s_addr;
+        if (ip[0] == 143 && ip[1] == 204 && ip[2] == 238 && ip[3] == 54)
+            orig.sin_addr.s_addr = inet_addr("143.204.238.8");
+        else if (ip[0] == 108 && ip[1] == 157 && ip[2] == 229 && ip[3] == 98)
+            orig.sin_addr.s_addr = inet_addr("108.157.229.62");
+    }
+
     int ufd = connect_upstream(&orig);
     if (ufd < 0) { dbg("не удалось соединиться с оригиналом"); return; }
-
     int leftover = 0;
     unsigned char *rest = NULL;
     if (g_split_ch && forward_split_hello(cfd, ufd, &rest, &leftover) < 0) {
@@ -379,7 +400,20 @@ static void relay_loop(int port) {
     if (getppid() == 1) _exit(0);
     setsid();
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);
+    // Раньше стоял SIG_IGN: ядро само перебирает детей, зомби нет, НО и
+    // узнать, сколько соединений на самом деле жив, невозможно. Счётчик
+    // только рос и за всю жизнь реля доходил до CHILD_MAX, после чего
+    // каждое новое соединение закрывалось сразу. Для VRChat это несколько
+    // сессий просмотра миров, и дальше аватары переставали грузиться до
+    // перезапуска. Теперь перебираем детей сами и уменьшаем счётчик.
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_child_exit;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+        sigaction(SIGCHLD, &sa, NULL);
+    }
     signal(SIGTERM, SIG_DFL);
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -394,6 +428,12 @@ static void relay_loop(int port) {
     if (listen(lfd, 128) != 0) _exit(3);
 
     for (;;) {
+        // Перебираем детей. Обработчик SIGCHLD только уменьшает счётчик, но
+        // сам зомби не забирает: ядро перебирает их только при SIG_IGN, а он
+        // здесь не установлен. Без этого строки процессов копятся до отказа
+        // fork(), после которого рель молча рвёт соединения.
+        while (waitpid(-1, NULL, WNOHANG) > 0) { }
+
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR) continue;
@@ -415,7 +455,20 @@ static void relay_loop(int port) {
             close(cfd);
             continue;
         }
+        // Счётчик растём ДО fork. Раньше он рос после, и ребёнок, завершившийся
+        // между fork и инкрементом, присылал SIGCHLD раньше, чем счётчик
+        // вырос: обработчик не мог уменьшить, и счётчик навсегда завышался —
+        // ровно та поломка, ради которой SIGCHLD и меняли.
+        g_children++;
         pid_t p = fork();
+        if (p < 0) {
+            if (g_children > 0) g_children--;
+            fprintf(stderr, "рель: fork не удался (%s) — соединение закрыто\n",
+                    strerror(errno));
+            close(cfd);
+            msleep(20);
+            continue;
+        }
         if (p == 0) {
             g_children = 0;                       // в ребёнке счётчик не нужен
             prctl(PR_SET_PDEATHSIG, SIGKILL);
@@ -426,9 +479,6 @@ static void relay_loop(int port) {
             _exit(0);
         }
         close(cfd);
-        if (p == 0) continue;
-        if (p > 0) g_children++;
-        else msleep(20);
     }
     _exit(0);
 }
@@ -461,9 +511,15 @@ int plain_relay_start(const plain_relay_config_t *cfg) {
     g_mark = (cfg && cfg->so_mark) ? cfg->so_mark : 0x4d5b;
     g_chunk = (cfg && cfg->chunk > 0) ? cfg->chunk : 0;
     g_pause_ms = (cfg && cfg->pause_ms > 0) ? cfg->pause_ms : 0;
-    // Без конечного таймаута pump() ждал бы poll(-1) вечно, и обработчики
-    // оседали бы в памяти навсегда: соединения, по которым не приходит данных,
-    // никто не закрывает. 30 с простоя — соединение уходит.
+    // 30 с простоя — защита, а не прихоть: без конечного таймаута pump()
+    // ждёт poll(-1) вечно, и соединения, по которым не идёт данных, оседают
+    // процессами навсегда. Ограничение держит их число в узде.
+    //
+    // ИЗВЕСТНОЕ РАСХОЖДЕНИЕ с plain_relay.h, где написано «0 = ждать
+    // бесконечно». Оставлено намеренно: значение по умолчанию защитное, и
+    // site_bypass.c его вообще не задаёт — значит 14 модулей на site_bypass
+    // получают 30 с. Сделать «0 = бесконечно» значило бы молча убрать защиту
+    // у всех них. Правку нужно принимать вместе с решением по site_bypass.
     g_idle_sec = (cfg && cfg->idle_sec > 0) ? cfg->idle_sec : 30;
     g_split_ch = (cfg && cfg->split_client_hello && cfg->frag_delay_ms > 0) ? 1 : 0;
     g_frag_delay_ms = (cfg && cfg->frag_delay_ms > 0) ? cfg->frag_delay_ms : 0;

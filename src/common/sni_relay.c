@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/mman.h>
 #include <signal.h>
 #include <poll.h>
 #include <fcntl.h>
@@ -62,6 +63,7 @@ static int g_dbg = -1;
 // Список имён, для которых сдвигается регистр первой буквы SNI.
 static int g_dbg_fd = -1;
 static int g_no_split_recs;
+static int g_shift_sni;
 // Включается только переменной окружения. Раньше здесь ещё проверялось
 // наличие файла /tmp/sni-debug, из-за чего подробный лог включался у всех, кто
 // этот файл создал, без всякого запроса.
@@ -225,32 +227,60 @@ void sni_shift_case(unsigned char *hs, int hs_len) {
 
 
 
+// Сколько частей дробить ClientHello. 2 — прежнее поведение, 3 и больше —
+// multisplit из zapret: DPI, умеющий склеивать поток, натыкается на большее
+// число границ, а первая граница по-прежнему ставится по SNI.
+static int g_multi_parts = 2;
+
 int sni_build_fragmented_ch(const unsigned char *hs, int hs_len,
                             unsigned char *out, int out_cap, int *first_seg_out) {
     if (!hs || !out || hs_len < 46) return -1;
-    int cut = sni_find_split(hs, hs_len);
-    if (cut <= 0) cut = hs_len / 2;
-    if (cut <= 0 || cut >= hs_len) return -1;
+    int parts = g_multi_parts >= 2 ? g_multi_parts : 2;
+    if (parts > 16) parts = 16;
+    if (parts > hs_len / 8) parts = hs_len / 8;
+    if (parts < 2) parts = 2;
 
-    int r1_pl = cut, r2_pl = hs_len - cut;
-    int r1 = 5 + r1_pl, r2 = 5 + r2_pl;
-    if (r1 + r2 > out_cap) return -1;
+    // Первая граница — по SNI, как раньше: именно на ней DPI обычно и спотыкается.
+    int first = sni_find_split(hs, hs_len);
+    if (first <= 0) first = hs_len / parts;
+    if (first < 1) first = 1;
+    if (first >= hs_len) first = hs_len - 1;
 
-    out[0] = 0x16; out[1] = 0x03; out[2] = 0x01;
-    out[3] = (unsigned char)(r1_pl >> 8); out[4] = (unsigned char)r1_pl;
-    memcpy(out + 5, hs, (size_t)r1_pl);
-    out[r1] = 0x16; out[r1 + 1] = 0x03; out[r1 + 2] = 0x01;
-    out[r1 + 3] = (unsigned char)(r2_pl >> 8); out[r1 + 4] = (unsigned char)r2_pl;
-    memcpy(out + r1 + 5, hs + r1_pl, (size_t)r2_pl);
+    int total = 0;
+    int pos = 0;
+    int cut = first;
+    for (int i = 0; i < parts; i++) {
+        int remain = hs_len - pos;
+        int take = cut;
+        if (i == parts - 1) take = remain;
+        if (take < 1 || take > remain) return -1;
+        if (total + 5 + take > out_cap) return -1;
+        unsigned char *rec = out + total;
+        rec[0] = 0x16; rec[1] = 0x03; rec[2] = 0x01;
+        rec[3] = (unsigned char)((take >> 8) & 0xFF);
+        rec[4] = (unsigned char)(take & 0xFF);
+        memcpy(rec + 5, hs + pos, (size_t)take);
+        total += 5 + take;
+        pos += take;
+        // Остаток делим поровну, последняя часть забирает всё.
+        // Делить только пока есть куда делить: на последней итерации
+        // parts - i - 1 == 0, и обычное деление на ноль убивало процесс
+        // рель-ребёнка на каждом соединении (SIGFPE).
+        int left = parts - i - 1;
+        if (left <= 0) break;
+        cut = (hs_len - pos) / left;
+        if (cut < 1) cut = 1;
+    }
 
     if (first_seg_out) {
         int fs = g_first_seg > 0 ? g_first_seg : 20;
-        if (fs >= r1) fs = r1 - 1;
+        int first_rec = 5 + first;
+        if (fs >= first_rec) fs = first_rec - 1;
         if (fs < 1) fs = 1;
         *first_seg_out = fs;
     }
-    return r1 + r2;
-}
+      return total;
+  }
 
 int sni_extract_name(const unsigned char *hs, int hs_len, char *out, size_t out_sz) {
     if (!out || out_sz == 0) return 0;
@@ -316,12 +346,19 @@ static int extract_client_hello(const unsigned char *buf, int len,
 
 // Полная отправка: короткий write на заполненном буфере не должен рвать поток,
 // иначе клиент видит оборванный ответ вместо ошибки.
+static int g_send_errno = 0;      // для диагностики: чем именно упал send
+static long g_send_left = -1;      // и сколько байт не отправилось
+
 static int send_all(int fd, const void *data, size_t n) {
     const unsigned char *p = data;
+    g_send_errno = 0;
+    g_send_left = -1;
     while (n > 0) {
         ssize_t s = send(fd, p, n, MSG_NOSIGNAL);
         if (s > 0) { p += s; n -= (size_t)s; continue; }
         if (s < 0 && errno == EINTR) continue;
+        g_send_errno = errno;
+        g_send_left = (long)n;
         return -1;
     }
     return 0;
@@ -354,8 +391,26 @@ static void splice_loop(int a, int b) {
             int dst = (i == 0) ? b : a;
 
             int off = 0;
+            int rec_left = 0;   // сколько байт ТЕКУЩЕЙ записи осталось
+                                // отправить как есть; >0 означает, что off
+                                // стоит внутри записи, а не на её границе
             while (off < n) {
                 int remain = (int)n - off;
+
+                // Внутри записи разбирать нечего: байты шифротекста, и
+                // «0x17» в них — случайное совпадение, а не тип записи.
+                if (rec_left > 0) {
+                    int chunk = rec_left < remain ? rec_left : remain;
+                    if (send_all(dst, buf + off, (size_t)chunk) != 0) {
+                        why = "send-raw-mid";
+                        goto out;
+                    }
+                    if (i == 0) sent_c += chunk; else sent_s += chunk;
+                    off += chunk;
+                    rec_left -= chunk;
+                    continue;
+                }
+
                 if (!g_no_split_recs && remain >= 5 && buf[off] == 0x16) {
                     int rlen = (buf[off + 3] << 8) | buf[off + 4];
                     int rec_end = off + 5 + rlen;
@@ -375,8 +430,12 @@ static void splice_loop(int a, int b) {
                         if (send_all(dst, hdr1, 5) != 0) { why = "send-hdr1"; goto out; }
                         if (send_all(dst, buf + off + 5, (size_t)split) != 0) { why = "send-p1"; goto out; }
                         msleep(1);
-                        int hdr2[5] = {0x16, 0x03, 0x01,
-                                        ((rlen - split) >> 8) & 0xFF, (rlen - split) & 0xFF};
+                        // Именно unsigned char: массив int отдавал бы наружу
+                        // 5 байт от начала, то есть 16 00 00 00 03 — сломанный
+                        // заголовок второй половины.
+                        unsigned char hdr2[5] = {0x16, 0x03, 0x01,
+                                        (unsigned char)(((rlen - split) >> 8) & 0xFF),
+                                        (unsigned char)((rlen - split) & 0xFF)};
                         if (send_all(dst, hdr2, 5) != 0) { why = "send-hdr2"; goto out; }
                         if (send_all(dst, buf + off + 5 + split, (size_t)(rlen - split)) != 0) { why = "send-p2"; goto out; }
                         off = rec_end;
@@ -411,23 +470,55 @@ static void splice_loop(int a, int b) {
                         continue;
                     }
                 }
+                // Запись с данными не помещается в этот recv (или не режем) —
+                // шлём как есть. Но если она обрезана границей буфера, её хвост
+                // придёт в следующих recv, и до него разбирать записи нельзя:
+                // off окажется внутри шифротекста, где «0x17» — случайный байт.
+                //
+                // Раньше здесь ничего не помечалось, и на записях длиннее
+                // g_data_chunk (4096) цикл регулярно останавливался посреди
+                // записи, после чего следующая итерация читала «длину записи»
+                // из мусора и резала поток по выдуманным смещениям. Клиент
+                // получал битый кадр и отвечал "decryption failed or bad record
+                // mac" — воспроизводилось 10 из 10.
+                if (g_split_data && remain >= 5 && buf[off] == 0x17) {
+                    int rlen = (buf[off + 3] << 8) | buf[off + 4];
+                    int rec_end = off + 5 + rlen;
+                    if (rec_end > n) {
+                        // запись продолжается за пределами буфера
+                        rec_left = rec_end - off;
+                        dbg("partial data record off=%d rlen=%d left=%d",
+                            off, rlen, rec_left);
+                    }
+                }
+
                 int chunk = remain;
                 if (chunk > g_data_chunk) chunk = g_data_chunk;
-                ssize_t s = send(dst, buf + off, (size_t)chunk, MSG_NOSIGNAL);
-                if (s != chunk) {
-                    dbg("send short want=%d got=%zd errno=%d dir=%c", chunk, s, errno,
-                        (i == 0) ? 'S' : 'C');
-                    why = "send-short";
+                if (rec_left > 0 && chunk > rec_left) chunk = rec_left;
+                if (chunk > 0) {
+                    ssize_t s = send(dst, buf + off, (size_t)chunk, MSG_NOSIGNAL);
+                    if (s != chunk) {
+                        why = "send-short";
+                        goto out;
+                    }
+                    if (i == 0) sent_c += chunk; else sent_s += chunk;
+                    off += chunk;
+                    if (rec_left > 0) rec_left -= chunk;
+                } else {
+                    // Защита от бесконечного цикла: еслиremain ненулевой, а
+                    // взять нечего — уходим, а не крутимся.
+                    why = "stall";
                     goto out;
                 }
-                if (i == 0) sent_c += s; else sent_s += s;
-                off += chunk;
                 if (g_data_pause_ms > 0) msleep(g_data_pause_ms);
+
             }
         }
     }
 out:
-    dbg("splice exit: %s (C->S=%ld S->C=%ld)", why, sent_c, sent_s);
+    dbg("splice exit: %s (C->S=%ld S->C=%ld) send_errno=%d(%s) left=%ld",
+        why, sent_c, sent_s, g_send_errno,
+        g_send_errno ? strerror(g_send_errno) : "-", g_send_left);
 }
 
 static int connect_one(const struct sockaddr_in *sa, const struct timeval *tv) {
@@ -499,10 +590,64 @@ static int add_ip_candidate(struct sockaddr_in *cands, int *n, int max,
     return add_unique(cands, n, max, &candidate);
 }
 
+// Последний сработавший апстрим. Без этого каждое соединение платит полный
+// перебор: на заблокированном адресе connect_upstream ждёт CONNECT_TIMEOUT,
+// потом пробует следующий, и так далее. На замере это выглядело как запросы
+// ровно на 15 с (таймаут curl) вперемешку с мгновенными отказами, хотя часть
+// адресов Discord в любой момент отвечает.
+//
+// Сработавший адрес ставится первым, поэтому после первого успеха стоимость
+// подключения падает до одного connect. Кэш один на весь рель: адреса у Discord
+// общие, и разные соединения идут к одному и тому же фронт-энду.
+// Соединения обрабатываются через fork() — по процессу на соединение. Обычная
+// статическая переменная тут не годится: ребёнок записывает адрес и умирает,
+// а родитель его изменения не видит, поэтому кэш всегда оставался пустым и
+// каждое соединение снова платило полный перебор кандидатов. Отдельный файл на
+// диске тоже не нужен — mmap до fork наследуется, а MAP_SHARED делает запись
+// видимой всем процессам реля, включая будущие дети.
+//
+// Размер фиксирован, запись — один snprintf. Формально запись и чтение могут
+// разойтись на границе байта, поэтому читаем вдвое: если строка не читается
+// как IP целиком, адрес просто не используется и делается обычный перебор.
+static char *g_last_good;
+
+// Задать адрес, который заведомо отдаёт данные целиком. Модуль вызывает это
+// после собственной проверки: у Discord часть адресов отдаёт файл полностью,
+// а часть режет поток примерно на 20 КБ. Перебор кандидатов тут не помогает —
+// обрезающий адрес принимает соединение нормально, просто не отдаёт файл, и
+// цикл connect_upstream его успешным не считает и дальше не идёт.
+//
+// Вызывать ДО sni_relay_start: страница общей памяти создаётся здесь, а рель
+// наследует её через fork. Создание страницы в цикле accept осталось как
+// запасной путь на случай, если предпочтение не задавали.
+void sni_relay_prefer(const char *ip) {
+    if (!ip || !ip[0]) return;
+    if (!g_last_good) {
+        g_last_good = mmap(NULL, INET_ADDRSTRLEN, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (g_last_good == MAP_FAILED) g_last_good = NULL;
+    }
+    if (!g_last_good) return;
+    struct in_addr chk;
+    if (inet_pton(AF_INET, ip, &chk) != 1) return;
+    snprintf(g_last_good, INET_ADDRSTRLEN, "%s", ip);
+}
+
 static int connect_upstream(const struct sockaddr_in *orig, int have_orig,
                             const char *sni, const struct timeval *tv) {
     struct sockaddr_in cands[8];
     int n = 0;
+
+    // Первым идёт адрес, который уже сработал. add_ip_candidate убирает
+    // повторы, так что если он совпадает с оригиналом или DoH-ответом, он
+    // просто окажется один раз.
+    if (g_last_good) {
+        char good[INET_ADDRSTRLEN] = {0};
+        memcpy(good, g_last_good, sizeof good - 1);
+        struct in_addr chk;
+        if (good[0] && inet_pton(AF_INET, good, &chk) == 1)
+            add_ip_candidate(cands, &n, 8, good);
+    }
 
     if (have_orig && orig && orig->sin_family == AF_INET) {
         char ip[INET_ADDRSTRLEN] = {0};
@@ -526,7 +671,12 @@ static int connect_upstream(const struct sockaddr_in *orig, int have_orig,
 
     for (int i = 0; i < n; i++) {
         int fd = connect_one(&cands[i], tv);
-        if (fd >= 0) return fd;
+        if (fd >= 0) {
+            if (g_last_good) { char t[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &cands[i].sin_addr, t, sizeof t))
+                    snprintf(g_last_good, INET_ADDRSTRLEN, "%s", t); }
+            return fd;
+        }
     }
 
     if (sni && sni[0]) {
@@ -551,12 +701,22 @@ static int connect_upstream(const struct sockaddr_in *orig, int have_orig,
             }
             for (int i = 0; i < n; i++) {
                 int fd = connect_one(&cands[i], tv);
-                if (fd >= 0) return fd;
+                if (fd >= 0) {
+                    if (g_last_good) { char t[INET_ADDRSTRLEN];
+                        if (inet_ntop(AF_INET, &cands[i].sin_addr, t, sizeof t))
+                    snprintf(g_last_good, INET_ADDRSTRLEN, "%s", t); }
+                    return fd;
+                }
             }
         } else {
             for (int i = have_orig ? 1 : 0; i < n; i++) {
                 int fd = connect_one(&cands[i], tv);
-                if (fd >= 0) return fd;
+                if (fd >= 0) {
+                    if (g_last_good) { char t[INET_ADDRSTRLEN];
+                        if (inet_ntop(AF_INET, &cands[i].sin_addr, t, sizeof t))
+                    snprintf(g_last_good, INET_ADDRSTRLEN, "%s", t); }
+                    return fd;
+                }
             }
         }
     }
@@ -592,6 +752,29 @@ static void handle_conn(int cfd) {
         dbg("CH recv n=%zd blen=%d", n, blen);
     }
     dbg("conn: CH ok hs_len=%d blen=%d consumed=%d have_orig=%d", hs_len, blen, consumed, have_orig);
+
+    // Сдвиг регистра первой буквы SNI. Длина байтов не меняется, поэтому ни
+    // длина TLS-записи, ни контрольные суммы трогать не нужно: поток к
+    // Cloudflare остаётся целым, а DPI перестаёт узнавать имя.
+    //
+    // Делаем ЗДЕСЬ, сразу после разбора, а не после отправки. Раньше вызов
+    // стоял ниже по коду, уже после того, как и фрагменты, и исходный буфер
+    // ушли в сокет, — то есть сдвигались байты, которые никто никогда не
+    // видел, и shift_sni не делал ровно ничего. Меняем оба буфера: в buf
+    // лежит подлинный ClientHello (его пересылает ветка без разрыва), из hs
+    // собираются фрагменты (ветка с разрывом).
+    if (g_shift_sni && hs_len > 0) {
+        // hs — склеенная handshake-структура (тип 0x01 + длина + тело). В buf
+        // она лежит подряд только когда ClientHello уместился в одну запись;
+        // тогда consumed == 5 + hs_len и начало структуры стоит на buf+5.
+        // Если записей было несколько, в buf байты разнесены, и сдвигать
+        // склеенный hs в буфере нечего — там правится только hs.
+        if (consumed == hs_len + 5)
+            sni_shift_case(buf + 5, hs_len);
+        sni_shift_case(hs, hs_len);
+        dbg("conn: shift_sni applied hs_len=%d contiguous=%d",
+            hs_len, consumed == hs_len + 5);
+    }
 
     if (hs_len < 0) {
         dbg("conn: no split in CH, raw forward, have_orig=%d", have_orig);
@@ -731,11 +914,13 @@ int sni_relay_start(const sni_relay_config_t *cfg) {
     }
     g_validate_ip = cfg ? cfg->validate_ip : NULL;
     g_no_split_recs = (cfg && cfg->no_split_handshake_records) ? 1 : 0;
+    g_shift_sni = (cfg && cfg->shift_sni) ? 1 : 0;
     g_split_data = (cfg && cfg->split_data_records) ? 1 : 0;
     g_split_size = (cfg && cfg->split_record_size > 0) ? cfg->split_record_size : 512;
     g_split_delay_ms = (cfg && cfg->split_record_delay_ms > 0) ? cfg->split_record_delay_ms : 1;
     // Незаданное поле = 0 = прежнее поведение (разрыв ClientHello включён).
     g_split_ch = (cfg && cfg->no_split_client_hello) ? 0 : 1;
+    g_multi_parts = (cfg && cfg->multi_parts >= 2) ? cfg->multi_parts : 2;
     g_data_chunk = (cfg && cfg->data_chunk > 0) ? cfg->data_chunk : 4096;
     g_data_pause_ms = (cfg && cfg->data_pause_ms < 0) ? -1
                       : (cfg && cfg->data_pause_ms > 0) ? cfg->data_pause_ms : 1;

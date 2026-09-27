@@ -97,9 +97,8 @@ static int parse_a_list(const unsigned char *resp, int n, char out[][64],
             if (!dup)
                 snprintf(out[(*count)++], 64, "%u.%u.%u.%u",
                          resp[off], resp[off + 1], resp[off + 2], resp[off + 3]);
-        } else {
-            off += rdlen;
         }
+        off += rdlen;
     }
     return (*count > 0) ? 0 : -1;
 }

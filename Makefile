@@ -15,9 +15,9 @@ PLUGS_DIR = $(BUILD_DIR)/bin/plugs
 RMF_BIN = $(BUILD_DIR)/bin/rmf
 WEBUI_BIN = $(BUILD_DIR)/bin/rmf-web
 
-MODULES = activision battlenet cloudflaredns discord electronicarts epicgames \
-          github google roblox soundcloud speedtestbyookla spotify steam \
-          telegram twitch vrchat x
+MODULES = 9gag activision battlenet cloudflaredns discord epicgames google \
+          netflix reddit roblox spotify steam telegram twitch universal vk vrchat \
+          github hf
 
 # Слой управления перехватом. Ровно один бэкенд на сборку: выбор платформы
 # делает Makefile, а не рантайм. Для Windows заменяется на
@@ -29,7 +29,24 @@ CORE_SRC = src/main.c src/proxy/proxy.c src/dns/dns_resolve.c \
            src/dns/doh_resolve.c src/common/sni_relay.c $(NETFILTER_SRC)
 
 
-.PHONY: all clean core plugs list webui rebuild
+.PHONY: all clean core plugs list webui rebuild desync desync-check
+
+# ── Слой десинхронизации (src/desync) ───────────────────
+# Отдельный от ядра: модуль подключает его сам и только для своих адресов.
+# Требует root при запуске, но не требует пересборки ядра.
+DESYNC_BIN = $(BUILD_DIR)/bin/rmf-desync
+
+desync:
+	@mkdir -p $(BUILD_DIR)/bin
+	$(CC) $(CFLAGS) -o $(DESYNC_BIN) $(SRC_DIR)/desync/desync_main.c \
+		$(SRC_DIR)/desync/desync.c -lpthread
+	@echo "  ✅ $(DESYNC_BIN)"
+
+# Проверка без прав и без сети: собирается ли слой и виден ли SNI в ClientHello.
+desync-check:
+	$(CC) $(CFLAGS) -Itest -o $(BUILD_DIR)/bin/desync-test test/desync_test.c \
+		$(SRC_DIR)/desync/desync.c -lpthread
+	@$(BUILD_DIR)/bin/desync-test
 
 all: core plugs webui
 
@@ -48,6 +65,22 @@ plugs: $(addprefix $(PLUGS_DIR)/,$(addsuffix .xo,$(MODULES)))
 	@echo "  ✅ All plugins built → $(PLUGS_DIR)/"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+# ── Универсальный шаблон (universal использует universal.h, нестандартный inject) ──
+$(PLUGS_DIR)/universal_entry.c:
+	@mkdir -p $(PLUGS_DIR)
+	@echo '#include "src/modules/universal/include/universal.h"' > $@
+	@echo 'static void universal_inject_stub(int fd) { (void)fd; }' >> $@
+	@echo '#define PLUGIN_NAME_STR "universal"' >> $@
+	@echo '#define PLUGIN_INIT_FN universal_module_init' >> $@
+	@echo '#define PLUGIN_INJECT_FN universal_inject_stub' >> $@
+	@echo '#define PLUGIN_CLEANUP_FN universal_module_cleanup' >> $@
+	@echo '#define PLUGIN_STATUS_FN universal_get_status' >> $@
+	@echo '#include "src/plugin_entry.h"' >> $@
+
+$(PLUGS_DIR)/universal.xo: $(PLUGS_DIR)/universal_entry.c $(filter-out %/test.c, $(wildcard src/modules/universal/src/*.c)) src/modules/universal/include/universal.h
+	@mkdir -p $(PLUGS_DIR)
+	$(CC) -shared -fPIC -I. $(CFLAGS) -o $@ $^
+	@echo "  ✅ universal.xo"
 
 # ── Шаблон плагина ────────────────────────────────────
 # $(1) = имя плагина
@@ -80,24 +113,25 @@ endef
 EXTRA_SRC_vrchat  = src/common/claims.c
 EXTRA_SRC_discord = src/common/claims.c
 
+$(eval $(call PLUGIN_template,9gag,9gag,ninegag))
 $(eval $(call PLUGIN_template,activision,activision,activision))
 $(eval $(call PLUGIN_template,battlenet,battlenet,battlenet))
 $(eval $(call PLUGIN_template,cloudflaredns,cloudflayerdnscom,cloudflayerdns))
 $(eval $(call PLUGIN_template,discord,discord,discord))
-$(eval $(call PLUGIN_template,electronicarts,electronicarts,electronicarts))
 $(eval $(call PLUGIN_template,epicgames,epicgames,epicgames))
-$(eval $(call PLUGIN_template,github,github,github))
 $(eval $(call PLUGIN_template,google,google,google))
+$(eval $(call PLUGIN_template,github,github,github))
+$(eval $(call PLUGIN_template,hf,hf,hf))
+$(eval $(call PLUGIN_template,netflix,netflix,netflix))
+$(eval $(call PLUGIN_template,reddit,reddit,reddit))
 $(eval $(call PLUGIN_template,roblox,robloxcom,roblox))
-$(eval $(call PLUGIN_template,soundcloud,soundcloudcom,soundcloud))
-$(eval $(call PLUGIN_template,speedtestbyookla,speedtestbyookla,speedtestbyookla))
 $(eval $(call PLUGIN_template,spotify,spotify,spotify))
 $(eval $(call PLUGIN_template,steam,steam,steam))
 PLUGIN_LIBS_telegram = -lssl -lcrypto -lpthread
 $(eval $(call PLUGIN_template,telegram,telegram,telegram))
 $(eval $(call PLUGIN_template,twitch,twitch,twitch))
+$(eval $(call PLUGIN_template,vk,vk,vk))
 $(eval $(call PLUGIN_template,vrchat,vrchat,vrchat))
-$(eval $(call PLUGIN_template,x,xcom,xcom))
 
 # ── List ──────────────────────────────────────────────
 list: core

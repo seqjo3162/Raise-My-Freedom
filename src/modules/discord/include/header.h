@@ -36,12 +36,15 @@ extern const char* discord_get_status(void);
 // Доступ к контексту (для relay и тестов)
 extern discord_ctx_t* discord_get_ctx(void);
 
-// Хелперы (чистые, тестируемые)
-extern int discord_is_target(const char* domain);
-extern int discord_find_sni_split(const unsigned char* hs, int hs_len);
-extern int discord_build_fragmented_ch(const unsigned char* hs, int hs_len,
-                                       unsigned char* out, int out_cap,
-                                       int* first_seg_out);
+// Разрезание SNI и сборка фрагментированного ClientHello живут в
+// src/common/sni_relay.c (sni_find_split, sni_build_fragmented_ch) — там же,
+// где ими реально пользуется рель. Копии в модуле были мертвым кодом:
+// вызывались только из несуществующего теста.
+
+// Хук реля: 1 = адрес в инфраструктуре Discord и годится в качестве
+// апстрим-кандидата. Без сети — вызывается на каждое соединение.
+// Живая проверка достижимости живёт в collect_own_ips, один раз при старте.
+extern int discord_validate_ip(const char* ip);
 
 // Свой релей (SNI-split) удалён: модуль использует общий
 // src/common/plain_relay.c, который не меняет TLS. Раньше здесь был

@@ -403,21 +403,29 @@ static int port_listening(int port, int udp) {
 
 static int plugin_ports(const char *name, int *udp_port, int *tcp_port) {
     static const struct { const char *name; int udp; int tcp; } ports[] = {
-        {"activision", 18562, 0}, {"battlenet", 18563, 0},
-        {"cloudflaredns", 0, 0}, {"discord", 0, 0},
-        {"electronicarts", 0, 0}, {"epicgames", 18565, 0},
-        {"github", 18590, 0}, {"google", 0, 18445},
-        {"roblox", 18566, 0}, {"soundcloud", 0, 0},
-        {"speedtestbyookla", 0, 0}, {"spotify", 18556, 0},
-        {"steam", 18568, 0}, {"telegram", 0, 1443},
-        {"twitch", 18558, 0}, {"vrchat", 15353, 0},
-        {"x", 0, 0},
+        {"9gag", 18552, 0}, {"activision", 18562, 0},
+        {"battlenet", 18563, 0}, {"cloudflaredns", 0, 0},
+        // 18443 — порт реля discord. Раньше здесь стояло {0, 0}, и
+        // wait_plugin_ready для discord просто ждал секунду и проверял, что
+        // процесс жив. Рель при этом мог не подняться (порт занят, fork
+        // упал), а веб рапортовал «стартовал»: трафик Discord уходил в
+        // REDIRECT на порт, где никто не слушает, и получал RST.
+        {"discord", 0, 18443},
+        {"epicgames", 18565, 0}, {"github", 18590, 0},
+        {"google", 0, 18445},
+        {"hf", 18595, 0}, {"netflix", 18554, 0},
+        {"reddit", 18555, 0}, {"roblox", 18566, 0},
+        {"spotify", 18556, 0}, {"steam", 18568, 0},
+        {"telegram", 0, 1443},
+        {"twitch", 18558, 0}, {"universal", 0, 0},
+        {"vk", 18559, 0}, {"vrchat", 15353, 0},
         {NULL, 0, 0}
     };
     for (int i = 0; ports[i].name; i++) {
         if (strcmp(ports[i].name, name) == 0) {
             if (udp_port) *udp_port = ports[i].udp;
             if (tcp_port) *tcp_port = ports[i].tcp;
+            if (strcmp(name, "universal") == 0 && udp_port) *udp_port = -1;
             return 1;
         }
     }
@@ -429,6 +437,14 @@ static int plugin_ports(const char *name, int *udp_port, int *tcp_port) {
 static int wait_plugin_ready(const char *name, pid_t pid) {
     int udp_port = 0, tcp_port = 0;
     plugin_ports(name, &udp_port, &tcp_port);
+    if (strcmp(name, "universal") == 0) {
+        for (int i = 0; i < 100; i++) {
+            if (!process_alive(pid)) return -1;
+            if (port_listening(5353, 1)) return 0;
+            usleep(100000);
+        }
+        return -1;
+    }
     if (udp_port == 0 && tcp_port == 0) {
         for (int i = 0; i < 10; i++) {
             if (!process_alive(pid)) return -1;
@@ -565,45 +581,22 @@ static void send_response(int fd, const char *status, const char *ct, const char
     (void)send_all(fd, body, blen);
 }
 
-// Вердикт доктора для метки вида GITHUB: берём из кольца логов строку,
-// где модуль сообщил своё решение. Раньше это разбирал python в
-// scripts/doctor-all.sh — парсить JSON в shell пришлось бы заново в каждом
-// скрипте, а решение всё равно принимает логика модуля.
-static void doctor_verdict(const char *label, char *out, size_t out_size) {
-    static const char *const keys[] = {
-        "проверка SNI", "домен ", "адрес выброшен", "недоступен", NULL
-    };
-    char needle[128];
-    snprintf(needle, sizeof(needle), "[%s]", label);
-    out[0] = '\0';
-    int n = log_ring.count < LOG_MAX ? log_ring.count : LOG_MAX;
-    int start = (log_ring.count < LOG_MAX) ? 0 : log_ring.head;
-    for (int i = 0; i < n; i++) {
-        const char *line = log_ring.lines[(start + i) % LOG_MAX];
-        if (!strstr(line, needle)) continue;
-        int hit = 0;
-        for (const char *const *k = keys; *k && !hit; k++)
-            if (strstr(line, *k)) hit = 1;
-        if (!hit) continue;
-        const char *tail = strchr(line, ']');
-        snprintf(out, out_size, "%s", tail && tail[1] ? tail + 1 : line);
-        char *nl = strpbrk(out, "\r\n");
-        if (nl) *nl = '\0';
-        char *p = out;
-        while (*p == ' ') p++;
-        if (p != out) memmove(out, p, strlen(p) + 1);
-        return;
-    }
-}
-
-static void send_text(int fd, const char *status, const char *text) {
-    char head[256];
-    int n = snprintf(head, sizeof(head),
-                     "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                     "Content-Length: %zu\r\nConnection: close\r\n\r\n", status, strlen(text));
-    if (n > 0) { ssize_t w = write(fd, head, (size_t)n); (void)w; }
-    ssize_t w = write(fd, text, strlen(text));
-    (void)w;
+// Страница интерфейса отдаётся без кэша. Без этого заголовка браузер
+// держит старую копию, и правки в UI не видно до ручной очистки кэша —
+// выглядит это как «открываю веб, а там ничего не нажимается».
+static void send_html_fresh(int fd, const char *body) {
+    char hdr[512];
+    size_t blen = strlen(body);
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        blen);
+    if (hlen < 0 || (size_t)hlen >= sizeof(hdr)) return;
+    if (send_all(fd, hdr, (size_t)hlen) < 0) return;
+    (void)send_all(fd, body, blen);
 }
 
 static void send_json(int fd, const char *status, const char *json) {
@@ -647,9 +640,8 @@ static int spawn_shell(const char *cmd) {
 }
 
 // Корень проекта: RMF_ROOT из run.sh, иначе три уровня вверх от бинарника
-// (build/bin/rmf-web -> корень). Раньше здесь был жёсткий абсолютный путь
-// к каталогу конкретной машины, из-за чего пересборка из веба на чужой системе
-// молча ничего не делала.
+// (build/bin/rmf-web -> корень). Раньше здесь был жёсткий путь /home/seqjo/rmf,
+// которого на этой машине нет, поэтому пересборка из веба молча ничего не делала.
 static const char *root_dir(void) {
     static char buf[1024];
     const char *env = getenv("RMF_ROOT");
@@ -837,7 +829,13 @@ static void terminate_process(pid_t pid) {
     if (killer == 0) {
         if (server_fd >= 0) close(server_fd);
         if (proxy_pipe[0] >= 0) close(proxy_pipe[0]);
-        usleep(1000000);
+        // Секунды не хватало. Плагин после SIGTERM просыпается от poll() не
+        // чаще раза в 500 мс, а его очистка — это десяток вызовов iptables
+        // через system(). Суммарно это переваливало за секунду, и SIGKILL
+        // приходил посередине. При SIGKILL очистка не выполняется, и в системе
+        // остаётся комплект REDIRECT на мёртвый порт реля: модуль выключен,
+        // а клиент получает мгновенный RST — ERR_CONNECTION_REFUSED.
+        usleep(3000000);
         if (kill(pid, 0) == 0) kill(pid, SIGKILL);
         _exit(0);
     }
@@ -966,30 +964,76 @@ static int start_plugin(const char *name, char *err, size_t errsz) {
     return 0;
 }
 
-static int stop_plugin(const char *name) {
-    const char *canonical_name = plugin_canonical_name(name);
-    if (!plugin_name_valid(canonical_name)) return 0;
-    plugin_proc_t *p = find_plugin(canonical_name);
-    if (!p) return 0;
-    if (p->pid > 0) {
-        pid_t pid = p->pid;
-        p->pid = 0;
-        p->active = 0;
-        terminate_process(pid);
-        drain_plugin_output(p);
-        if (p->out_fd >= 0) { close(p->out_fd); p->out_fd = -1; }
+  // Цепочки, которые может оставить конкретный модуль. Снятие нужно всегда —
+  // в том числе когда pid == 0 (см. stop_plugin).
+  static void plugin_chains(const char *name, char *out, size_t cap) {
+      snprintf(out, cap, "%s",
+               !strcmp(name, "discord") ? "DISCORD_BYPASS DISCORD_QUIC" : "");
+  }
 
-        char timebuf[64];
-        time_t now = time(NULL);
-        strftime(timebuf, sizeof(timebuf), "%H:%M:%S", localtime(&now));
-        char msg[256];
-        snprintf(msg, sizeof(msg), "[%s] Plugin %s stopped", timebuf, canonical_name);
-        log_add(msg);
-    }
-    p->pid = 0;
-    p->active = 0;
-    return 0;
-}
+  // Снять цепочки модуля. Нужно, когда процесс уже мёртв, а правила остались:
+  // таблица плагинов живёт в памяти веба, а правила iptables — в ядре, и после
+  // перезапуска службы веб о модуле не знает ничего. Прежний stop_plugin в этом
+  // случае просто ничего не делал, и REDIRECT оставался висеть на порту реля,
+  // где никто не слушает. Клиент получал мгновенный RST — ERR_CONNECTION_REFUSED
+  // при выключенном модуле. Списки цепочек вставляются из фиксированного
+  // белого списка, имя модуля в команду не попадает.
+  static void drop_plugin_chains(const char *name) {
+      char list[256];
+      plugin_chains(name, list, sizeof(list));
+      for (const char *ch = list; ch && *ch; ) {
+          const char *sp = strchr(ch, ' ');
+          size_t len = sp ? (size_t)(sp - ch) : strlen(ch);
+          char chain[64];
+          if (len > 0 && len + 1 < sizeof(chain)) {
+              memcpy(chain, ch, len);
+              chain[len] = '\0';
+              // По одной команде на строку: общий snprintf на шесть подстановок
+              // не помещался в буфер и обрезался, gcc на это ругался справедливо.
+              // Сами имена цепочек берутся из фиксированного списка выше.
+              char cmd[192];
+              snprintf(cmd, sizeof cmd, "iptables -t nat -D OUTPUT -j %s 2>/dev/null", chain);
+              if (system(cmd)) { /* правила могло не быть — не ошибка */ }
+              snprintf(cmd, sizeof cmd, "iptables -t nat -F %s 2>/dev/null", chain);
+              if (system(cmd)) {}
+              snprintf(cmd, sizeof cmd, "iptables -t nat -X %s 2>/dev/null", chain);
+              if (system(cmd)) {}
+              snprintf(cmd, sizeof cmd, "iptables -D OUTPUT -j %s 2>/dev/null", chain);
+              if (system(cmd)) {}
+              snprintf(cmd, sizeof cmd, "iptables -F %s 2>/dev/null", chain);
+              if (system(cmd)) {}
+              snprintf(cmd, sizeof cmd, "iptables -X %s 2>/dev/null", chain);
+              if (system(cmd)) {}
+          }
+          ch = sp ? sp + 1 : NULL;
+      }
+  }
+
+  static int stop_plugin(const char *name) {
+      const char *canonical_name = plugin_canonical_name(name);
+      if (!plugin_name_valid(canonical_name)) return 0;
+      plugin_proc_t *p = find_plugin(canonical_name);
+      if (p && p->pid > 0) {
+          pid_t pid = p->pid;
+          p->pid = 0;
+          p->active = 0;
+          terminate_process(pid);
+          drain_plugin_output(p);
+          if (p->out_fd >= 0) { close(p->out_fd); p->out_fd = -1; }
+  
+          char timebuf[64];
+          time_t now = time(NULL);
+          strftime(timebuf, sizeof(timebuf), "%H:%M:%S", localtime(&now));
+          char msg[256];
+          snprintf(msg, sizeof(msg), "[%s] Plugin %s stopped", timebuf, canonical_name);
+          log_add(msg);
+      }
+      if (p) { p->pid = 0; p->active = 0; }
+      // Правила снимаем независимо от pid: модуль мог умереть, оставив их, а
+      // веб после рестарта службы о нём ничего не знает.
+      drop_plugin_chains(canonical_name);
+      return 0;
+  }
 
 static void kill_all_rmf(void) {
     pid_t pid = fork();
@@ -1097,22 +1141,6 @@ static void handle_request(int fd) {
         char json[16384];
         get_status_json(json, sizeof(json));
         send_json(fd, "200 OK", json);
-    } else if (strncmp(path, "/api/verdict", 12) == 0) {
-        // Решение доктора по одному модулю обычным текстом: для скриптов,
-        // которым не нужен разбор JSON.
-        char label[64] = {0}, verdict[256] = {0};
-        const char *qp = strstr(path, "?plugin=");
-        if (qp) {
-            const char *end = strchr(qp + 8, '&');
-            size_t len = end ? (size_t)(end - (qp + 8)) : strlen(qp + 8);
-            if (len >= sizeof(label)) len = sizeof(label) - 1;
-            memcpy(label, qp + 8, len);
-            label[len] = '\0';
-        }
-        for (char *q = label; *q; q++) *q = (char)toupper((unsigned char)*q);
-        if (!label[0]) { send_text(fd, "400 Bad Request", "нужен ?plugin=\n"); return; }
-        doctor_verdict(label, verdict, sizeof(verdict));
-        send_text(fd, "200 OK", verdict[0] ? verdict : "решения пока нет\n");
     } else if (strncmp(path, "/api/logs", 9) == 0) {
         char json[LOG_MAX * 520 + 16];
         char tag[128] = {0}, q[256] = {0};
@@ -1309,7 +1337,7 @@ static void handle_request(int fd) {
         send_json(fd, "200 OK", r == 0 ? "{\"ok\":true,\"queued\":true}" : "{\"ok\":false}");
     } else if (strcmp(path, "/api/flush") == 0) {
         const char *cmd =
-            "for ch in GITHUB_BYPASS DISCORD_BYPASS VRCHAT_BYPASS GOOGLE_YT_BYPASS "
+            "for ch in GITHUB_BYPASS DISCORD_BYPASS DISCORD_QUIC VRCHAT_BYPASS GOOGLE_YT_BYPASS "
             "NINEGAG_BYPASS NETFLIX_BYPASS REDDIT_BYPASS SPOTIFY_BYPASS TWITCH_BYPASS "
             "VK_BYPASS ROBLOX_BYPASS STEAM_BYPASS ACTIVISION_BYPASS BATTLENET_BYPASS "
             "EPICGAMES_BYPASS HF_BYPASS RMF_DNS; do "
@@ -1327,8 +1355,7 @@ static void handle_request(int fd) {
             "\"POST /api/start?plugin=<name>\",\"POST /api/stop?plugin=<name>\","
             "\"POST /api/stopall\",\"POST /api/backup\",\"POST /api/save\","
             "\"POST /api/rebuild?plugin=<name>\",\"POST /api/rebuild\",\"POST /api/flush\","
-            "\"POST /api/restart?target=web|proxy|all\","
-            "\"GET /api/verdict?plugin=\",\"GET /api/info\"]}");
+            "\"POST /api/restart?target=web|proxy|all\",\"GET /api/info\"]}");
     } else if (strncmp(path, "/api/restart", 12) == 0) {
         char target[64] = {0};
         const char *qp = strstr(path, "?target=");
@@ -1379,7 +1406,7 @@ static void handle_request(int fd) {
                     close(ff);
                     if (total == size) {
                         body[total] = '\0';
-                        send_response(fd, "200 OK", "text/html", body);
+                        send_html_fresh(fd, body);
                     } else {
                         send_response(fd, "500 Internal Server Error", "text/plain", "Read error");
                     }
@@ -1406,7 +1433,6 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
     char *project_root = getenv("RMF_ROOT");
-    if (!project_root) project_root = getenv("MINIZAPRET_ROOT");
     if (!project_root) {
         char exe_path[512];
         ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -1426,7 +1452,6 @@ int main(int argc, char *argv[]) {
     if (!project_root) project_root = ".";
     snprintf(g_project_root, sizeof(g_project_root), "%s", project_root);
     const char *port_value = getenv("RMF_PORT");
-    if (!port_value) port_value = getenv("MINIZAPRET_PORT");
     if (port_value && *port_value) {
         char *end = NULL;
         long parsed = strtol(port_value, &end, 10);

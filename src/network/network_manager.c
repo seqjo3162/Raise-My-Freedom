@@ -48,7 +48,7 @@ const char *iptables_get_blocked_ports(void) {
 
 int iptables_rules_apply(void) {
     printf("[IPTABLES] Proxy mode: system DNS should point to 127.0.0.1\n");
-    printf("[IPTABLES] No iptables rules needed — DNS proxy handles interception\n");
+    printf("[IPTABLES] No iptables rules needed — universal proxy handles interception\n");
     return 0;
 }
 

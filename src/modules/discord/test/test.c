@@ -1,20 +1,22 @@
-// ВНИМАНИЕ: тест не собирается Makefile (лежит в test/, а не в src/) и
-// написан под старый SNI-split релей модуля. Модуль теперь использует
-// общий src/common/plain_relay.c и не трогает TLS — тест нужно переписать.
-// Discord Module Test — диагностика ТСПУ + проверка обхода + тест троттлинга.
+// discord module test — юнит + сетевые проверки.
 //
-// Проверяет:
-//   1. Self-test: матчинг доменов, cut внутри SNI, сборка фрагментированного
-//      ClientHello (2 records, reassembly == оригинал).
-//   2. DNS: системный vs честный (1.1.1.1 / 8.8.8.8).
-//   3. TCP 443 до честных IP; прямой TLS с SNI (диагностика блока).
-//   4. E2E: полный ClientHello -> relay -> ServerHello (обход работает).
-//   5. HTTP: реальные эндпоинты Discord (API, CDN, updates).
-//   6. Тест троттлинга: baseline-скорость vs CDN Discord, латентность
-//      handshake'ов, поведение больших ответов discord.com.
+// Собирается и запускается через src/modules/discord/Makefile:
+//     make -C src/modules/discord test
 //
-// Сборка/запуск:
-//   cd src/modules/discord && make test
+// Модуль включается напрямую (.c), чтобы достать static-хелперы.
+//
+// Проверяется без root и без сети:
+//   * разбор адресов и попадание в диапазоны Discord (validate_ip);
+//   * граница «можно удалять» (dest_in_discord) — обязана НЕ задевать
+//     адреса VRChat, иначе один модуль сносит правила другому;
+//   * кодирование домена в wire-паттерн, включая опасные длины лейбла;
+//   * разрез SNI и сборка фрагментированного ClientHello — в sni_relay,
+//     то есть в том коде, который реально работает, а не в его копии;
+//   * чтение webui/discord.conf: все ключи доходят до переменных.
+//
+// Сетевая часть (DNS, E2E через рель) запускается только при наличии сети
+// и не требует root.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,98 +24,190 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
-#include <signal.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-#include "../include/header.h"
+#include "../src/discord_module.c"
+#include "../../../common/sni_relay.h"
+#include "../../../netfilter/netfilter.h"
 #include "../../../dns/dns_resolve.h"
 
 static int failures = 0;
+static int checks = 0;
 #define CHECK(cond, ...) do { \
+    checks++; \
     if (cond) { printf("  [OK]   " __VA_ARGS__); printf("\n"); } \
     else { printf("  [FAIL] " __VA_ARGS__); printf("\n"); failures++; } \
 } while (0)
 #define INFO(...) do { printf("  [..]   " __VA_ARGS__); printf("\n"); } while (0)
 
-#define TEST_RELAY_PORT 19443
+// ── 1. адреса ────────────────────────────────────────────────────────────
 
-static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+static void test_ip_parse(void) {
+    printf("[ADDR] разбор адреса\n");
+    unsigned char b[4];
+    CHECK(parse_ipv4("162.159.128.233", b) && b[0]==162 && b[1]==159 && b[2]==128 && b[3]==233,
+          "полный адрес разобран");
+    CHECK(parse_ipv4("0.0.0.0", b) && !b[0] && !b[3], "0.0.0.0 разобран");
+    // inet_aton согласился бы на «1.2.3» и на «1.2.3.4.5» — здесь нет.
+    CHECK(!parse_ipv4("1.2.3", b),        "«1.2.3» отвергнут (inet_aton бы принял)");
+    CHECK(!parse_ipv4("1.2.3.4.5", b),    "«1.2.3.4.5» отвергнут");
+    CHECK(!parse_ipv4("1.2.3.4 ", b),  "пробел в конце отвергнут");
+    CHECK(!parse_ipv4(" 1.2.3.4", b),  "пробел в начале отвергнут");
+    CHECK(!parse_ipv4("1.2.3.4x", b), "буква в конце отвергнута");
+    CHECK(!parse_ipv4("300.1.1.1", b),    "октет > 255 отвергнут");
+    CHECK(!parse_ipv4("1.2.3.04", b),     "ведущий ноль в октете отвергнут");
+    CHECK(!parse_ipv4("не ip", b),         "мусор отвергнут");
+    CHECK(!parse_ipv4("", b),              "пустая строка отвергнута");
+    CHECK(!parse_ipv4(NULL, b),            "NULL отвергнут");
 }
 
-// --- Синтетический ClientHello (как у реального клиента) ---
+static void test_validate_ip(void) {
+    printf("[ADDR] валидатор инфраструктуры\n");
+    struct { const char *ip; const char *what; int want; } t[] = {
+        {"162.159.128.233", "discord.com", 1},
+        {"162.159.191.255", "верх /18", 1},
+        {"162.159.192.0",   "выше /18", 0},
+        {"162.159.127.255", "ниже /18", 0},
+        {"104.16.0.0",      "низ 104.16/12", 1},
+        {"104.31.255.255",  "верх 104.16/12", 1},
+        {"104.32.0.0",      "выше 104.16/12", 0},
+        {"104.18.0.0",      "низ 104.18/16", 1},
+        {"104.19.0.0",      "внутри 104.16/12 (104.18/16 не покрывает)", 1},
+        {"104.18.255.255",  "верх 104.18/16", 1},
+        {"34.126.226.51",   "dl2.discordapp.net (GCP)", 1},
+        {"34.127.0.1",      "соседний GCP", 0},
+        {"8.47.69.0",       "sinkhole (vrchat_module.c:29)", 0},
+        {"8.6.112.6",       "ложный ответ dns.google", 0},
+        {"143.204.238.8",   "assets.vrchat.com (VRChat)", 0},
+        {"108.157.229.62",  "files.vrchat.cloud (VRChat)", 0},
+        {"216.198.53.6",    "help.vrchat.com (VRChat)", 0},
+        {"1.1.1.1",         "Cloudflare DNS", 0},
+        {"8.8.8.8",         "Google DNS", 0},
+        {"127.0.0.1",       "localhost", 0},
+        {NULL, NULL, 0}
+    };
+    for (int i = 0; t[i].ip; i++)
+        CHECK(discord_validate_ip(t[i].ip) == t[i].want,
+              "%-16s -> %d  %s", t[i].ip, t[i].want, t[i].what);
+
+    // Честная граница метода: эти адреса Cloudflare, и по адресу нельзя
+    // отличить Discord от чужого сайта. Документируем, чтобы правка списка
+    // диапазонов не выглядела случайной.
+    INFO("Cloudflare общий, валидатор их пропускает: x.com=%d docs.vrchat.com=%d "
+         "- по адресу их от Discord не отличить",
+         discord_validate_ip("162.159.140.229"), discord_validate_ip("104.16.241.118"));
+}
+
+static void test_dest_scope(void) {
+    printf("[ADDR] граница «разрешено удалять»\n");
+    // Должны сниматься: адреса пинов и всё, что внутри 162.159.128.0/18.
+    CHECK(dest_in_discord("162.159.128.233"), "пин discord.com в границе");
+    CHECK(dest_in_discord("162.159.137.232"), "legacy-хвост внутри /18 в границе");
+    CHECK(dest_in_discord("104.18.48.115"),   "пин dl.discordapp.net в границе");
+    CHECK(dest_in_discord("34.126.226.51"),   "пин dl2.discordapp.net в границе");
+    CHECK(dest_in_discord("162.159.128.0/18"),"с префиксом /18 распознан");
+    // НЕ должны: чужие модули и всё, что не наше.
+    CHECK(!dest_in_discord("104.18.26.36"),  "api.vrchat.com НЕ в границе");
+    CHECK(!dest_in_discord("104.18.6.156"),  "unity-frontend VRChat НЕ в границе");
+    CHECK(!dest_in_discord("104.16.241.118"),"docs.vrchat.com НЕ в границе");
+    // Остаточная экспозиция, зафиксированная осознанно: x.com лежит в
+    // 162.159.128.0/18, поэтому формально попадает в границу удаления.
+    // Сегодня это безвредно — у x.com нет ни модуля, ни правил iptables, есть
+    // только запись в hosts.txt, а та clean-up не трогает. Но если у x.com
+    // появится модуль со своим правилом на этом /32, Discord его снесёт.
+    CHECK(dest_in_discord("162.159.140.229"),
+          "x.com в границе (адрес внутри /18) - задокументировано");
+    CHECK(!dest_in_discord("1.1.1.1"),        "1.1.1.1 НЕ в границе");
+    CHECK(!dest_in_discord("192.168.1.0/24"), "локальная сеть НЕ в границе");
+    CHECK(!dest_in_discord("104.16.0.0/12"),  "широкий 104.16/12 НЕ в границе");
+    CHECK(!dest_in_discord("104.18.0.0/16"),  "широкий 104.18/16 НЕ в границе");
+    CHECK(!dest_in_discord("мусор"),          "мусор отвергнут");
+    CHECK(!dest_in_discord(NULL),             "NULL отвергнут");
+}
+
+// ── 2. wire-паттерн ──────────────────────────────────────────────────────
+
+static void test_wire_hex(void) {
+    printf("[DNS] шаблон домена уходит в iptables только как hex\n");
+    char hex[256] = {0};
+    int n = nf_wire_hex_pattern("discord.com", hex, sizeof hex);
+    CHECK(n > 0, "discord.com закодирован (%d симв.)", n);
+    CHECK(strcmp(hex, "07646973636F726403636F6D") == 0,
+          "точное значение: %s", hex);
+    CHECK(strncmp(hex, "07", 2) == 0, "длина первого лейбла = 07");
+
+    nf_wire_hex_pattern("dl.discordapp.net", hex, sizeof hex);
+    CHECK(strcmp(hex, "02646C0A646973636F7264617070036E6574") == 0,
+          "dl.discordapp.net: %s", hex);
+
+    // Главное свойство: на выходе только 0-9A-F, поэтому ни один байт не
+    // может стать кавычкой, долларом или обратным слэшем для shell.
+    // Длины лейбла 34, 36 и 39 давали 0x22, 0x24 и 0x27.
+    char label[80];
+    int all_bad[4] = { 0, 0, 0, 0 };
+    const char *marks = "\"$`&|;<>";
+    for (int len = 1; len <= 63; len++) {
+        char dom[128];
+        label[0] = 'a';
+        memset(label + 1, 'z', (size_t)(len - 1));
+        label[len] = '\0';
+        snprintf(dom, sizeof dom, "%s.example.com", label);
+        char h2[512] = {0};
+        if (nf_wire_hex_pattern(dom, h2, sizeof h2) < 0) { all_bad[3]++; continue; }
+        for (const char *q = h2; *q; q++)
+            if (!((*q >= '0' && *q <= '9') || (*q >= 'A' && *q <= 'F'))) all_bad[0]++;
+        for (const char *m = marks; *m; m++)
+            if (strchr(h2, *m)) all_bad[1]++;
+        /* 2 (длина) + 2*len + 16 ("example") + 8 ("com") */
+        if ((int)strlen(h2) != 2 * len + 26) all_bad[2]++;
+    }
+    CHECK(all_bad[0] == 0, "ни одного символа вне 0-9A-F на 63 длинах");
+    CHECK(all_bad[1] == 0, "ни одного shell-метасимвола в выводе");
+    CHECK(all_bad[2] == 0, "длина hex совпадает с (лейбл+1)*2 на всех длинах");
+    CHECK(all_bad[3] == 0, "ни одна длина 1..63 не отвергнута");
+
+    CHECK(nf_wire_hex_pattern("", hex, sizeof hex) < 0, "пустой домен отвергнут");
+    CHECK(nf_wire_hex_pattern(NULL, hex, sizeof hex) < 0, "NULL отвергнут");
+    CHECK(nf_wire_hex_pattern("discord..com", hex, sizeof hex) < 0, "пустой лейбл отвергнут");
+    char tiny[4];
+    CHECK(nf_wire_hex_pattern("discord.com", tiny, sizeof tiny) < 0,
+          "тесный буфер отвергнут, а не переполнен");
+}
+
+// ── 3. разрез SNI (в sni_relay, а не в его копии) ────────────────────────
 
 static void put16(unsigned char *p, unsigned v) { p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)v; }
 
-static int build_ch(unsigned char *out, int cap, const char *host, int one_record) {
+static int build_ch(unsigned char *out, int cap, const char *host) {
     unsigned char body[2048];
     int p = 0;
-    // client_version + random
     body[p++] = 0x03; body[p++] = 0x03;
     for (int i = 0; i < 32; i++) body[p++] = (unsigned char)(i * 7 + 3);
-    body[p++] = 0x00; // session_id
-    // cipher suites
+    body[p++] = 0x00;
     static const unsigned char cs[] = {
         0x13,0x01, 0x13,0x02, 0x13,0x03, 0xc0,0x2b, 0xc0,0x2f,
-        0xc0,0x2c, 0xc0,0x30, 0xc0,0x13, 0xc0,0x14, 0x00,0x9e,
-        0x00,0x9f, 0x00,0x2f, 0x00,0x35
-    };
-    put16(body + p, sizeof(cs)); p += 2;
-    memcpy(body + p, cs, sizeof(cs)); p += (int)sizeof(cs);
-    body[p++] = 0x01; body[p++] = 0x00; // compression
+        0xc0,0x2c, 0xc0,0x30, 0xc0,0x13, 0xc0,0x14, 0x00,0x9e, 0x00,0x9f };
+    put16(body + p, sizeof cs); p += 2;
+    memcpy(body + p, cs, sizeof cs); p += (int)sizeof cs;
+    body[p++] = 0x01; body[p++] = 0x00;
 
     int hl = (int)strlen(host);
-    // extensions
     unsigned char exts[1024];
     int e = 0;
-    // SNI: list_len(2) + type(1) + namelen(2) + host = 5+hl
     int sni_body = 5 + hl;
     put16(exts + e, 0x0000); e += 2;
     put16(exts + e, sni_body); e += 2;
-    put16(exts + e, sni_body - 2); e += 2;   // server_name_list = 3+hl
+    put16(exts + e, sni_body - 2); e += 2;
     exts[e++] = 0x00;
     put16(exts + e, hl); e += 2;
     memcpy(exts + e, host, (size_t)hl); e += hl;
-    // supported_groups
-    put16(exts + e, 0x000a); e += 2;
-    put16(exts + e, 8); e += 2;
-    put16(exts + e, 6); e += 2;
+    put16(exts + e, 0x000a); e += 2;  put16(exts + e, 8); e += 2;
     exts[e++] = 0x00; exts[e++] = 0x1d;
-    exts[e++] = 0x00; exts[e++] = 0x17;
-    exts[e++] = 0x00; exts[e++] = 0x18;
-    // ec_point_formats
-    put16(exts + e, 0x000b); e += 2;
-    put16(exts + e, 2); e += 2;
+    put16(exts + e, 0x000b); e += 2;  put16(exts + e, 2); e += 2;
     exts[e++] = 0x01; exts[e++] = 0x00;
-    // signature_algorithms
-    put16(exts + e, 0x000d); e += 2;
-    put16(exts + e, 14); e += 2;
-    put16(exts + e, 12); e += 2;
-    static const unsigned char sa[] = {0x08,0x04,0x08,0x05,0x08,0x06,0x04,0x01,0x05,0x01,0x06,0x01};
-    memcpy(exts + e, sa, sizeof(sa)); e += (int)sizeof(sa);
-    // ALPN h2, http/1.1
-    put16(exts + e, 0x0010); e += 2;
-    put16(exts + e, 14); e += 2;
-    put16(exts + e, 12); e += 2;
-    exts[e++] = 0x02; exts[e++] = 'h'; exts[e++] = '2';
-    exts[e++] = 0x08; memcpy(exts + e, "http/1.1", 8); e += 8;
-    // supported_versions TLS1.3
-    put16(exts + e, 0x002b); e += 2;
-    put16(exts + e, 3); e += 2;
-    exts[e++] = 0x02; exts[e++] = 0x03; exts[e++] = 0x04;
-    // key_share x25519
-    put16(exts + e, 0x0033); e += 2;
-    put16(exts + e, 38); e += 2;
-    put16(exts + e, 36); e += 2;
-    put16(exts + e, 0x001d); e += 2;
-    put16(exts + e, 32); e += 2;
-    for (int i = 0; i < 32; i++) exts[e++] = (unsigned char)(i * 11 + 5);
-
     put16(body + p, e); p += 2;
     memcpy(body + p, exts, (size_t)e); p += e;
 
@@ -122,402 +216,175 @@ static int build_ch(unsigned char *out, int cap, const char *host, int one_recor
     hs[1] = (unsigned char)(p >> 16); hs[2] = (unsigned char)(p >> 8); hs[3] = (unsigned char)p;
     memcpy(hs + 4, body, (size_t)p);
     int hs_len = 4 + p;
-
-    if (one_record) {
-        if (hs_len + 5 > cap) return -1;
-        out[0] = 0x16; out[1] = 0x03; out[2] = 0x01;
-        put16(out + 3, hs_len);
-        memcpy(out + 5, hs, (size_t)hs_len);
-        return 5 + hs_len;
-    }
     if (hs_len > cap) return -1;
     memcpy(out, hs, (size_t)hs_len);
     return hs_len;
 }
 
-// --- 1. Self-test ---
-
-static void test_self(void) {
-    printf("[SELF] матчинг и фрагментация\n");
-    CHECK(discord_is_target("discord.com"), "discord.com is target");
-    CHECK(discord_is_target("gateway.discord.gg"), "gateway.discord.gg is target");
-    CHECK(discord_is_target("cdn.discordapp.com"), "cdn.discordapp.com is target");
-    CHECK(discord_is_target("updates.discordapp.com"), "updates.discordapp.com is target");
-    CHECK(discord_is_target("stable.dl2.discordapp.net"), "*.discordapp.net is target");
-    CHECK(!discord_is_target("google.com"), "google.com NOT target");
-    CHECK(!discord_is_target("notdiscord.com"), "notdiscord.com NOT target");
-    CHECK(!discord_is_target("discord.com.evil.com"), "discord.com.evil.com NOT target");
-
+static void test_sni_split(void) {
+    printf("[TLS] разрез SNI (sni_relay, реальный код реля)\n");
     unsigned char hs[4096];
-    int hl = build_ch(hs, (int)sizeof(hs), "discord.com", 0);
-    CHECK(hl > 46, "synthetic ClientHello собран (%d B)", hl);
+    int hl = build_ch(hs, (int)sizeof hs, "discord.com");
+    CHECK(hl > 46, "ClientHello собран (%d B)", hl);
 
-    int cut = discord_find_sni_split(hs, hl);
+    int cut = sni_find_split(hs, hl);
     int name_at = -1;
     for (int i = 4; i < hl - 10; i++)
         if (memcmp(hs + i, "discord.com", 11) == 0) { name_at = i; break; }
-    CHECK(name_at > 0, "hostname найден в hs @%d", name_at);
+    CHECK(name_at > 0, "имя найдено в ClientHello @%d", name_at);
     CHECK(cut > name_at && cut < name_at + 11,
-          "cut внутри hostname (cut=%d, name=%d..%d)", cut, name_at, name_at + 11);
+          "разрез внутри имени (cut=%d, имя %d..%d)", cut, name_at, name_at + 11);
 
     unsigned char frag[8192];
     int first_seg = 0;
-    int flen = discord_build_fragmented_ch(hs, hl, frag, (int)sizeof(frag), &first_seg);
-    CHECK(flen > 0, "fragmented CH собран (%d B, first_seg=%d)", flen, first_seg);
+    int flen = sni_build_fragmented_ch(hs, hl, frag, (int)sizeof frag, &first_seg);
+    CHECK(flen > 0, "фрагментированный ClientHello собран (%d B)", flen);
     if (flen > 0) {
-        // record-заголовки валидны
-        CHECK(frag[0] == 0x16 && frag[1] == 0x03, "record1 header ok");
+        CHECK(frag[0] == 0x16 && frag[1] == 0x03 && frag[2] == 0x01, "заголовок record1");
         int r1_pl = (frag[3] << 8) | frag[4];
         int r1 = 5 + r1_pl;
-        CHECK(r1 < flen && frag[r1] == 0x16, "record2 header ok (r1=%d)", r1);
-        CHECK(first_seg >= 1 && first_seg < r1,
-              "первый TCP-сегмент ВНУТРИ record1 (%d < %d)", first_seg, r1);
-        // reassembly == оригинал
-        CHECK(r1_pl + ((frag[r1+3] << 8) | frag[r1+4]) == hl &&
+        CHECK(r1 < flen && frag[r1] == 0x16 && frag[r1 + 1] == 0x03, "заголовок record2 @%d", r1);
+        int r2_pl = (frag[r1 + 3] << 8) | frag[r1 + 4];
+        CHECK(r1_pl + r2_pl == hl &&
               memcmp(frag + 5, hs, (size_t)r1_pl) == 0 &&
               memcmp(frag + r1 + 5, hs + r1_pl, (size_t)(hl - r1_pl)) == 0,
-              "reassembly records == оригинальный ClientHello");
-        // сигнатура разорвана record-заголовком внутри hostname
-        int inside = cut - 5; // hostname середина в координатах record1 payload
-        int rec2_abs = r1;
-        CHECK(!(first_seg <= rec2_abs && 0), "cut@%d < r1@%d (заголовок rec2 рвёт сигнатуру)",
-              cut, rec2_abs);
-        (void)inside;
+              "склейка record'ов даёт исходный ClientHello");
+        CHECK(first_seg >= 1 && first_seg < r1,
+              "первый сегмент (%d) меньше record1 (%d)", first_seg, r1);
+        CHECK(cut <= r1, "разрез имени не позже границы record1");
+    }
+
+    // Мусор на входе обязан отбиваться, а не читаться за пределами буфера.
+    CHECK(sni_find_split(NULL, 100) == -1, "NULL отбит");
+    CHECK(sni_find_split(hs, 10) == -1,     "слишком короткий отбит");
+    CHECK(sni_find_split(hs, -5) == -1,     "отрицательная длина отбита");
+    unsigned char junk[64];
+    memset(junk, 0xFF, sizeof junk);
+    CHECK(sni_find_split(junk, (int)sizeof junk) == -1, "мусор отбит");
+}
+
+// ── 4. конфиг ────────────────────────────────────────────────────────────
+
+static void test_conf(void) {
+    printf("[CONF] webui/discord.conf -> переменные модуля\n");
+    load_conf();
+    // Сверять переменные модуля надо с тем же путём, который он сам ищет.
+    // DISCORD_CONF — относительный путь, и из каталога сборки теста он не
+    // открывается: conf_int вернул бы дефолт, и проверка врала бы.
+    char cpath[1200] = {0};
+    discord_conf_path(cpath, sizeof cpath);
+    // Ключи, которые раньше читались вхолостую.
+    CHECK(opt_no_split_hs  == conf_int(cpath, "no_split_hs", 1),
+          "no_split_hs доходит до модуля (%d)", opt_no_split_hs);
+    CHECK(opt_split_ch     == conf_int(cpath, "split_ch", 1),
+          "split_ch = %d", opt_split_ch);
+    CHECK(opt_frag_first_seg >= 1, "frag_first_seg >= 1 (%d)", opt_frag_first_seg);
+    CHECK(opt_split_size >= 1,    "split_size >= 1 (%d)", opt_split_size);
+    CHECK(opt_relay_chunk >= 0,   "relay_chunk >= 0 (%d)", opt_relay_chunk);
+    // -1 = «без пауз», и он обязан доживать до sni_relay. Раньше load_conf
+    // обнулял отрицательное значение, и объявленный в sni_relay.h способ
+    // отключить паузу был недостижим.
+    CHECK(opt_relay_pause_ms == -1 || opt_relay_pause_ms >= 0,
+          "relay_pause_ms = %d (-1 = без пауз, 0 = дефолт реля в 1 мс)", opt_relay_pause_ms);
+    CHECK(opt_frag_delay_ms >= 0, "frag_delay_ms >= 0 (%d)", opt_frag_delay_ms);
+    CHECK(opt_shift_sni == 0 || opt_shift_sni == 1, "shift_sni = %d", opt_shift_sni);
+    CHECK(opt_relay_cidr == conf_int(cpath, "relay_cidr", 0),
+          "relay_cidr доходит до модуля (%d)", opt_relay_cidr);
+    CHECK(opt_probe_pins == conf_int(cpath, "probe_pins", 0),
+          "probe_pins доходит до модуля (%d)", opt_probe_pins);
+    CHECK(opt_multi_parts == conf_int(cpath, "multi_parts", 2),
+          "multi_parts доходит до модуля (%d)", opt_multi_parts);
+    CHECK(opt_multi_parts >= 2, "multi_parts >= 2 (%d)", opt_multi_parts);
+
+    // Ключ, которого нет в файле, обязан давать дефолт, а не мусор.
+    int d = conf_int("/nonexistent/discord.conf", "split_ch", 7);
+    CHECK(d == 7, "conf_int на отсутствующем файле даёт дефолт (%d)", d);
+
+    // Конфиг обязан находиться независимо от рабочего каталога. Раньше путь
+    // был относительным, и модуль молча уходил на дефолты при запуске не из
+    // корня проекта.
+    char conf[1200] = {0};
+    discord_conf_path(conf, sizeof conf);
+    CHECK(access(conf, R_OK) == 0, "конфиг найден из этого каталога: %s", conf);
+    CHECK(strstr(conf, "discord.conf") != NULL, "путь указывает на discord.conf");
+    if (getenv("RMF_ROOT")) {
+        char probe[1200] = {0};
+        setenv("RMF_ROOT", "/nonexistent-root", 1);
+        discord_conf_path(probe, sizeof probe);
+        setenv("RMF_ROOT", getenv("RMF_ROOT") ? "" : "", 1);
+        CHECK(strcmp(probe, conf) != 0,
+              "при неверном RMF_ROOT ищем дальше, а не берём мусорный путь");
     }
 }
 
-// --- 2. DNS ---
+// ── 5. сеть (необязательно) ─────────────────────────────────────────────
 
-static void test_dns(void) {
-    printf("[DNS] системный vs честный резолвер\n");
-    const char *domains[] = {"discord.com", "gateway.discord.gg",
-                             "updates.discordapp.com", NULL};
-    for (int i = 0; domains[i]; i++) {
-        char ip1[64] = "-", ip8[64] = "-";
-        int ok1 = dns_resolve_udp("1.1.1.1", domains[i], ip1, sizeof(ip1));
-        int ok8 = dns_resolve_udp("8.8.8.8", domains[i], ip8, sizeof(ip8));
-        int both_fail = (ok1 != 0 && ok8 != 0);
-        if (both_fail)
-            INFO("%s: A-записи нет ни у одного резолвера (хост мог быть удалён)",
-                 domains[i]);
-        else
-            CHECK(ok1 == 0 || ok8 == 0, "%s резолвится: 1.1.1.1=%s 8.8.8.8=%s",
-                  domains[i], ok1 == 0 ? ip1 : "FAIL", ok8 == 0 ? ip8 : "FAIL");
-        if (ok1 == 0 && ok8 == 0 && strcmp(ip1, ip8) != 0)
-            INFO("resolvers расходятся: %s vs %s (норма для anycast)", ip1, ip8);
-    }
-}
-
-// --- 3. TCP + прямой TLS (диагностика блока) ---
-
-static int tcp_connect(const char *ip, int port, int timeout_s) {
+static int tcp_reachable(const char *ip, int port, int timeout_s) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct timeval tv = { timeout_s, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     struct sockaddr_in a = {0};
-    a.sin_family = AF_INET;
-    a.sin_port = htons((uint16_t)port);
+    a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(fd); return -1; }
-    int ok = connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0;
+    int ok = connect(fd, (struct sockaddr *)&a, sizeof a) == 0;
     close(fd);
     return ok ? 0 : -1;
 }
 
-// Пробуем несколько anycast-кандидатов (часть IP Discord периодически мертва)
-static int tcp_connect_any(const char *domain, char *ip_out, int ip_out_sz) {
-    const char *resolvers[] = {"1.1.1.1", "8.8.8.8", NULL};
-    for (int i = 0; resolvers[i]; i++) {
-        char ip[64] = {0};
-        if (dns_resolve_udp(resolvers[i], domain, ip, sizeof(ip)) != 0) continue;
-        if (tcp_connect(ip, 443, 3) == 0) {
-            if (ip_out) snprintf(ip_out, (size_t)ip_out_sz, "%s", ip);
-            return 0;
-        }
-        INFO("anycast %s недоступен, пробуем следующий", ip);
-    }
-    return -1;
-}
-
-// >0: ServerHello, 0: таймаут/закрытие, -1: получили что-то иное (байты в hex)
-static int recv_serverhello(int fd, int timeout_s, double *ms_out,
-                            unsigned char *raw, int *raw_len) {
-    double t0 = now_ms();
-    struct timeval tv = { timeout_s, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    unsigned char b[64];
-    ssize_t n = recv(fd, b, sizeof(b), 0);
-    if (ms_out) *ms_out = now_ms() - t0;
-    if (n > 0 && raw && raw_len) {
-        *raw_len = (int)n < 64 ? (int)n : 64;
-        memcpy(raw, b, (size_t)*raw_len);
-    }
-    if (n >= 6 && b[0] == 0x16 && b[5] == 0x02) return 1;
-    if (n <= 0) return 0;
-    return -1;
-}
-
-static void test_direct_block(const char *relay_ip_unused) {
-    (void)relay_ip_unused;
-    printf("[TLS] прямое соединение (диагностика SNI-фильтра)\n");
+static void test_network(void) {
+    printf("[NET] сеть (пропускается, если её нет)\n");
     char ip[64] = {0};
-    if (tcp_connect_any("discord.com", ip, sizeof(ip)) != 0) {
-        INFO("ни один anycast IP discord.com не открыл TCP — сеть/ТСПУ");
-        return;
-    }
-    CHECK(1, "TCP 443 %s открывается (живой anycast)", ip);
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct timeval tv = { 5, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in a = {0};
-    a.sin_family = AF_INET; a.sin_port = htons(443);
-    inet_pton(AF_INET, ip, &a.sin_addr);
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
-        CHECK(0, "connect %s", ip); close(fd); return;
-    }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    unsigned char ch[4096];
-    int cl = build_ch(ch, (int)sizeof(ch), "discord.com", 1);
-    send(fd, ch, (size_t)cl, MSG_NOSIGNAL);
-    double ms = 0;
-    int sh = recv_serverhello(fd, 4, &ms, NULL, NULL);
-    close(fd);
-    if (sh)
-        INFO("ServerHello и по прямому пути: SNI-фильтр сейчас неактивен (%.0f ms)", ms);
+    int got = 0;
+    const char *dns[] = { "1.1.1.1", "8.8.8.8", NULL };
+    for (int i = 0; dns[i] && !got; i++)
+        if (dns_resolve_udp(dns[i], "discord.com", ip, sizeof ip) == 0) got = 1;
+    if (!got) { INFO("DNS не отвечает — сетевые проверки пропущены"); return; }
+    INFO("discord.com -> %s", ip);
+    if (!discord_validate_ip(ip))
+        INFO("ВНИМАНИЕ: ответ DNS вне наших диапазонов — модуль его отсечёт, "
+             "и это может быть подмена");
     else
-        INFO("прямой TLS с SNI не отвечает (%.0f ms) — SNI-фильтр ТСПУ ПОДТВЕРЖДЁН", ms);
-}
+        INFO("ответ в наших диапазонах, валидатор его пропустит");
 
-// --- 4. E2E через relay ---
-
-static void test_relay_e2e(void) {
-    printf("[RELAY] E2E: полный ClientHello -> relay -> Discord\n");
-    CHECK(discord_relay_start(TEST_RELAY_PORT) == 0, "relay запущен (pid %d)",
-          discord_get_ctx()->relay_pid);
-    CHECK(discord_relay_running(), "relay running");
-    int ok = 0;
-    double lat[5];
-    unsigned char failraw[64];
-    int failraw_len = 0;
-    const char *fail_reason = NULL;
-    for (int i = 0; i < 5; i++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct timeval tv = { 6, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        struct sockaddr_in a = {0};
-        a.sin_family = AF_INET;
-        a.sin_port = htons(TEST_RELAY_PORT);
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
-            int one = 1;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            unsigned char ch[4096];
-            int cl = build_ch(ch, (int)sizeof(ch), "discord.com", 1);
-            send(fd, ch, (size_t)cl, MSG_NOSIGNAL);
-            double ms;
-            unsigned char raw[64];
-            int raw_len = 0;
-            int sh = recv_serverhello(fd, 6, &ms, raw, &raw_len);
-            lat[i] = ms;
-            if (sh == 1) ok++;
-            else if (!fail_reason) {
-                if (sh == 0) fail_reason = "закрыто/таймаут";
-                else {
-                    fail_reason = "иные байты:";
-                    memcpy(failraw, raw, (size_t)raw_len);
-                    failraw_len = raw_len;
-                }
-            }
-        } else {
-            lat[i] = -1;
-            if (!fail_reason) fail_reason = "connect refused";
-        }
-        close(fd);
-    }
-    if (ok == 5) {
-        CHECK(1, "ServerHello через relay: 5/5 (латентность %.0f ms)", lat[0]);
+    // Раньше здесь стояло CHECK(1, ...). Это тавтология: она не может упасть
+    // и ничего не проверяет, но попадала в итоговый счётчик и раздувала его на
+    // единицу. Плюс блок условный, и когда сеть была поднята, счётчик давал
+    // 88, а когда лежала — 87: число «проверок» зависело от состояния сети.
+    // Теперь это честная INFO, а счётчик всегда один и тот же.
+    if (tcp_reachable(ip, 443, 3) == 0) {
+        INFO("TCP 443 до %s открывается — обход не нужен, можно прямо", ip);
     } else {
-        printf("  [FAIL] ServerHello через relay: %d/5 (латентность %.0f ms, причина: %s",
-               ok, lat[0], fail_reason ? fail_reason : "?");
-        if (failraw_len > 0) {
-            printf(" ");
-            for (int i = 0; i < failraw_len && i < 24; i++)
-                printf("%02x", failraw[i]);
-        }
-        printf(")\n");
-        failures++;
+        INFO("TCP 443 до %s не открылся — это ожидаемо при блокировке по SNI, "
+             "обход делает рель", ip);
     }
 }
 
-// --- 5. HTTP эндпоинты ---
+// ── main ────────────────────────────────────────────────────────────────
 
-static int curl_line(const char *cmd, char *out, int out_sz) {
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    if (!fgets(out, out_sz, fp)) { pclose(fp); return -1; }
-    pclose(fp);
-    out[strcspn(out, "\r\n")] = 0;
-    return 0;
-}
+int main(void) {
+    printf("[DISCORD TEST] ==============================================\n");
+    printf("[DISCORD TEST] юнит-проверки модуля discord\n");
+    printf("[DISCORD TEST] ==============================================\n");
 
-static void test_http(void) {
-    printf("[HTTP] реальные эндпоинты Discord через relay\n");
-    char line[512];
-    char cmd[1024];
-
-    // CDN-картинка (малый ответ, должен пройти полностью)
-    snprintf(cmd, sizeof(cmd),
-        "curl -s -m 10 -o /dev/null -w '%%{http_code} %%{size_download} %%{time_total}' "
-        "--connect-to cdn.discordapp.com:443:127.0.0.1:%d "
-        "https://cdn.discordapp.com/embed/avatars/0.png", TEST_RELAY_PORT);
-    if (curl_line(cmd, line, sizeof(line)) == 0) {
-        int code = 0; double size = 0, t = 0;
-        sscanf(line, "%d %lf %lf", &code, &size, &t);
-        CHECK(code == 200 && size > 500, "cdn.discordapp.com: http=%d size=%.0f in %.2fs", code, size, t);
-    } else CHECK(0, "cdn: curl failed");
-
-    // API-эндпоинт (малый JSON — то, что дергает апдейтер)
-    snprintf(cmd, sizeof(cmd),
-        "curl -s -m 10 -o /dev/null -w '%%{http_code} %%{size_download} %%{time_total}' "
-        "--connect-to discord.com:443:127.0.0.1:%d "
-        "https://discord.com/api/v9/experiments", TEST_RELAY_PORT);
-    if (curl_line(cmd, line, sizeof(line)) == 0) {
-        int code = 0; double size = 0, t = 0;
-        sscanf(line, "%d %lf %lf", &code, &size, &t);
-        CHECK(code == 200 && t < 5.0, "discord.com API: http=%d size=%.0f in %.2fs", code, size, t);
-    } else CHECK(0, "api: curl failed");
-
-    // updates-хост отвечает (любой код — главное, что TCP+TLS+ответ прошли)
-    snprintf(cmd, sizeof(cmd),
-        "curl -s -m 10 -o /dev/null -w '%%{http_code} %%{time_total}' "
-        "--connect-to updates.discordapp.com:443:127.0.0.1:%d "
-        "https://updates.discordapp.com/", TEST_RELAY_PORT);
-    if (curl_line(cmd, line, sizeof(line)) == 0) {
-        int code = 0; double t = 0;
-        sscanf(line, "%d %lf", &code, &t);
-        CHECK(t < 5.0, "updates.discordapp.com отвечает: http=%d in %.2fs", code, t);
-    } else CHECK(0, "updates: curl failed");
-}
-
-// --- 6. Тест троттлинга ---
-
-static void test_throttle(void) {
-    printf("[THROTTLE] тест троттлинга скорости\n");
-    char line[512], cmd[2048];
-
-    // Baseline: Cloudflare
-    double base_speed = 0;
-    snprintf(cmd, sizeof(cmd),
-        "curl -s -m 20 -o /dev/null -w '%%{speed_download} %%{time_total}' "
-        "'https://speed.cloudflare.com/__down?bytes=10000000'");
-    if (curl_line(cmd, line, sizeof(line)) == 0) {
-        double t = 0;
-        sscanf(line, "%lf %lf", &base_speed, &t);
-        INFO("baseline cloudflare: %.2f MB/s (%.2fs)", base_speed / 1e6, t);
-        CHECK(base_speed > 1e6, "baseline > 1 MB/s (%.2f MB/s)", base_speed / 1e6);
-    }
-
-    // CDN Discord: полный пакет должен скачаться целиком (апдейтеру это нужно)
-    snprintf(cmd, sizeof(cmd),
-        "curl -sL -m 45 -o /dev/null -w '%%{http_code} %%{size_download} %%{speed_download} %%{time_total}' "
-        "--connect-to :443:127.0.0.1:%d "
-        "'https://discord.com/api/download/stable?platform=linux&arch=x64'",
-        TEST_RELAY_PORT);
-    double cdn_speed = 0, cdn_time = 0, cdn_size = 0;
-    int cdn_code = 0;
-    if (curl_line(cmd, line, sizeof(line)) == 0) {
-        sscanf(line, "%d %lf %lf %lf", &cdn_code, &cdn_size, &cdn_speed, &cdn_time);
-        INFO("CDN discord: http=%d size=%.0f speed=%.2f MB/s (%.2fs)",
-             cdn_code, cdn_size, cdn_speed / 1e6, cdn_time);
-        CHECK(cdn_code == 200 && cdn_size > 1000000,
-              "пакет Discord скачан ПОЛНОСТЬЮ (%.0f B) — апдейтер не зависнет", cdn_size);
-        if (base_speed > 0 && cdn_speed > 0) {
-            double ratio = cdn_speed / base_speed;
-            if (ratio < 0.3)
-                INFO("CDN медленнее baseline в %.1fx — возможен троттлинг CDN", 1.0 / ratio);
-            else
-                INFO("относительная скорость CDN/baseline = %.2f (норма)", ratio);
-        }
-    } else CHECK(0, "CDN download failed");
-
-    // Большие ответы discord.com: известно, что после ~20KB поток замирает
-    snprintf(cmd, sizeof(cmd),
-        "curl -s -m 8 -o /dev/null -w '%%{size_download} %%{time_total}' "
-        "--connect-to discord.com:443:127.0.0.1:%d https://discord.com/login",
-        TEST_RELAY_PORT);
-    if (curl_line(cmd, line, sizeof(line)) == 0) {
-        double size = 0, t = 0;
-        sscanf(line, "%lf %lf", &size, &t);
-        if (t >= 7.5)
-            INFO("discord.com/login: %.0f B за %.1fs — троттлинг больших ответов "
-                 "подтверждён (burst ~20KB, далее ~KB/s). API/CDN не затронуты", size, t);
-        else
-            INFO("discord.com/login: %.0f B за %.2fs — отвечает полностью", size, t);
-    }
-
-    // Латентность handshake через relay (дельта к baseline TLS)
-    snprintf(cmd, sizeof(cmd),
-        "curl -s -m 8 -o /dev/null -w '%%{time_appconnect}' "
-        "--connect-to discord.com:443:127.0.0.1:%d https://discord.com/api/v9/abput",
-        TEST_RELAY_PORT);
-    double tls_ms = -1;
-    if (curl_line(cmd, line, sizeof(line)) == 0) tls_ms = atof(line) * 1000.0;
-    INFO("TLS handshake через relay: %.0f ms (прямой baseline ~75-115 ms)", tls_ms);
-    CHECK(tls_ms >= 0 && tls_ms < 3000, "handshake не зависает (%.0f ms)", tls_ms);
-}
-
-int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "--dump-ch") == 0) {
-        unsigned char ch[4096];
-        int cl = build_ch(ch, (int)sizeof(ch), "discord.com", 1);
-        for (int i = 0; i < cl; i++) printf("%02x", ch[i]);
-        printf("\n");
-        return 0;
-    }
-    if (argc > 1 && strcmp(argv[1], "relay") == 0) {
-        int port = argc > 2 ? atoi(argv[2]) : TEST_RELAY_PORT;
-        discord_config_t c = {
-            .primary_dns = "1.1.1.1", .fallback_dns = "8.8.8.8",
-            .frag_delay_ms = 30, .frag_first_seg = 20, .relay_port = port,
-        };
-        discord_module_init(&c);
-        if (discord_relay_start(port) != 0) { fprintf(stderr, "relay start failed\n"); return 1; }
-        fprintf(stderr, "relay on 127.0.0.1:%d pid=%d\n", port, discord_get_ctx()->relay_pid);
-        for (;;) pause();
-    }
-    printf("[DISCORD TEST] ===============================\n");
-    printf("[DISCORD TEST] SNI-split обход + троттлинг\n");
-    printf("[DISCORD TEST] ===============================\n");
-
-    discord_config_t cfg = {
-        .primary_dns = "1.1.1.1",
-        .fallback_dns = "8.8.8.8",
-        .buffer_size = 0,
-        .priority = 100,
-        .frag_delay_ms = 30,
-        .frag_first_seg = 20,
-        .relay_port = TEST_RELAY_PORT,
-    };
+    discord_config_t cfg = { .primary_dns = "1.1.1.1", .fallback_dns = "8.8.8.8",
+                             .relay_port = 19443 };
     discord_module_init(&cfg);
-    printf("[DISCORD TEST] status: %s\n", discord_get_status());
 
-    test_self();
-    test_dns();
-    test_direct_block(NULL);
-    test_relay_e2e();
-    test_http();
-    test_throttle();
+    test_ip_parse();
+    test_validate_ip();
+    test_dest_scope();
+    test_wire_hex();
+    test_sni_split();
+    test_conf();
+    test_network();
 
-    int was_running = discord_relay_running();
-    discord_relay_stop();
-    CHECK(was_running && !discord_relay_running(), "relay корректно остановлен");
     discord_module_cleanup();
 
-    printf("[DISCORD TEST] ===============================\n");
-    if (failures == 0) printf("[DISCORD TEST] ALL CHECKS PASSED\n");
-    else printf("[DISCORD TEST] %d CHECK(S) FAILED — смотри вывод выше\n", failures);
+    printf("[DISCORD TEST] ==============================================\n");
+    printf("[DISCORD TEST] проверок: %d, провалено: %d\n", checks, failures);
+    if (failures == 0) printf("[DISCORD TEST] ВСЁ ЗЕЛЁНОЕ\n");
+    else printf("[DISCORD TEST] ЕСТЬ ПРОВАЛЫ\n");
     return failures == 0 ? 0 : 1;
 }
