@@ -2,6 +2,7 @@
 #define RMF_SITE_BYPASS_H
 
 #include <stdbool.h>
+#include <time.h>
 #include <stddef.h>
 
 typedef struct {
@@ -47,6 +48,15 @@ typedef struct {
     char fallback[32];
     char chain[64];
     bool relay_on;
+    // Фоновая перепроверка крутится, пока модуль жив. Флаг ставится до
+    // остановки рельи и DNS, иначе поток успеет записать в файл после того,
+    // как ответчик уже снят, и следующий запуск стартует с чужого адреса.
+    volatile bool stopping;
+    // Файл закреплений модуля и время его последнего изменения. Ответчик
+    // перечитывает файл, когда mtime отличается от запомненного, поэтому
+    // фоновая перепроверка в родителе влияет на ответ и без перезапуска.
+    char pin_path[512];
+    time_t pin_mtime;
 } site_bypass_state_t;
 
 int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *config);

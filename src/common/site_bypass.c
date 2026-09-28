@@ -3,6 +3,7 @@
 #include "src/netfilter/netfilter.h"
 #include "src/dns/dns_resolve.h"
 #include "src/dns/doh_resolve.h"
+#include <pthread.h>
 #include "src/common/plain_relay.h"
 #include "src/common/site_probe.h"
 
@@ -35,6 +36,10 @@ typedef struct {
     char domain[256];
     char ip[64];
 } site_pin_t;
+
+// Опережающее объявление: ответчик пользуется перечитыванием раньше, чем
+// доходит до определения, потому что сам ответчик описан выше по файлу.
+static void pins_reload(const char *path, size_t cap);
 
 static site_pin_t site_pins[MAX_SITE_DOMAINS];
 static int site_pin_count;
@@ -399,6 +404,19 @@ static void dns_child(site_bypass_state_t *state, int ready_fd) {
 
     unsigned char query[4096], response[4096];
     while (1) {
+        // Файл закреплений перечитываем, когда он изменился.
+        //
+        // Ответчик — отдельный процесс, форкнутый от модуля, и раньше он
+        // держал копию закреплений в памяти на всё время жизни. Фоновая
+        // перепроверка в родителе дописывает в файл удачные адреса, и без
+        // этого они были видны только после перезапуска модуля.
+        if (state->pin_path[0]) {
+            struct stat pst;
+            if (stat(state->pin_path, &pst) == 0 && pst.st_mtime != state->pin_mtime) {
+                state->pin_mtime = pst.st_mtime;
+                pins_reload(state->pin_path, sizeof(state->pin_path));
+            }
+        }
         struct sockaddr_in client;
         socklen_t client_len = sizeof(client);
         ssize_t received = recvfrom(fd, query, sizeof(query), 0,
@@ -469,6 +487,142 @@ static void dns_stop(site_bypass_state_t *state) {
     waitpid(pid, NULL, 0);
 }
 
+
+// ── Фоновая перепроверка закреплений ───────────────────────────────────────
+//
+// Зачем. Сегодня модуль узнаёт об изменившейся сети только при перезапуске:
+// адрес, который провайдер зарезал, остаётся в ответе DNS, и сайт лежит до
+// того, как модуль перезапустят руками. Наблюдалось на github.com — он уехал
+// на зарезанный адрес, и сайт не открывался до перезапуска.
+//
+// Что делает поток. Раз в REFITSH_INTERVAL секунд проверяет закреплённые адреса
+// помеченной пробой. Ответил — ничего не трогаем. Не ответил — ищем новый
+// адрес и записываем его в файл. Ответчик перечитывает файл по mtime, и новый
+// адрес доезжает до клиента без перезапуска.
+//
+// Поток создаётся строго после dns_start. Ответчик — форкнутый процесс, и
+// поток в нём оказаться не должен: иначе он продолжит работать в копии, где
+// нет ни сокета ответчика, ни изменений.
+//
+// Поток не трогает site_pins и не ставит правила сам: он пишет только файл.
+// Всё остальное подхватывает ответчик по mtime. Так не появляется гонка между
+// потоком и основным потоком модуля за общий список закреплений.
+#define REFRESH_INTERVAL 120
+
+typedef struct {
+    site_bypass_state_t *state;
+    char module[64];
+    const char *const *domains;
+    size_t domain_count;
+    int relay_on;
+} refresh_ctx_t;
+
+
+// Заменить строку "домен адрес" в файле закреплений или дописать её.
+//
+// Пишем через временный файл и rename, потому что ответчик читает этот файл
+// на лету и при обычной перезаписи увидел бы обрезанный на середине.
+static void pin_file_replace(const char *path, const char *line) {
+    if (!path || !path[0] || !line || !line[0]) return;
+    char tmp[560];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    char cur[256], ip[64];
+    char keep[64][400];
+    int nkeep = 0;
+    // Домен из новой строки. Раньше тут сравнивался домен со всей строкой
+    // целиком, сравнение никогда не сходилось, и старая запись оставалась в
+    // файле: в итоге на один домон приходилось два адреса, и ответчик отдавал
+    // заведомо мёртвый первый.
+    char new_dom[256];
+    if (sscanf(line, "%255s", new_dom) != 1) return;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char buf[400];
+        while (nkeep < 64 && fgets(buf, sizeof(buf), f)) {
+            if (sscanf(buf, "%255s %63s", cur, ip) != 2) continue;
+            if (strcasecmp(cur, new_dom) == 0) continue;
+            snprintf(keep[nkeep], sizeof(keep[0]), "%s %s\n", cur, ip);
+            nkeep++;
+        }
+        fclose(f);
+    }
+    FILE *o = fopen(tmp, "w");
+    if (!o) return;
+    for (int i = 0; i < nkeep; i++) fputs(keep[i], o);
+    fputs(line, o);
+    fclose(o);
+    rename(tmp, path);
+}
+
+// Контекст фоновой перепроверки. Живёт всё время работы модуля, поток его
+// не освобождает: состояние остановки видно по state->stopping.
+static refresh_ctx_t g_refresh;
+static pthread_t g_refresh_th;
+static bool g_refresh_running;
+
+// Запуск фоновой перепроверки. Вызывается только после dns_start: ответчик
+// форкнут, и поток не должен попасть в его копию.
+static void *pin_refresh_thread(void *arg);
+static void start_pin_refresh(site_bypass_state_t *state,
+                              const site_bypass_config_t *config) {
+    if (g_refresh_running) return;
+    if (!config || !config->domains || !config->domain_count) return;
+    if (!config->name || !config->name[0]) return;
+    g_refresh.state = state;
+    g_refresh.domains = config->domains;
+    g_refresh.domain_count = config->domain_count;
+    snprintf(g_refresh.module, sizeof(g_refresh.module), "%s", config->name);
+    g_refresh.relay_on = state->relay_on;
+    if (pthread_create(&g_refresh_th, NULL, pin_refresh_thread, &g_refresh) == 0)
+        g_refresh_running = true;
+}
+
+static void *pin_refresh_thread(void *arg) {
+    refresh_ctx_t *ctx = arg;
+    site_bypass_state_t *state = ctx->state;
+
+    while (state->active && !state->stopping) {
+        for (size_t i = 0; i < ctx->domain_count; i++) {
+            if (!state->active || state->stopping) break;
+            if (!ctx->domains[i]) continue;
+            char domain[256];
+            normalize_domain(ctx->domains[i], domain, sizeof(domain));
+            if (!domain[0]) continue;
+
+            char cur[64] = {0};
+            for (int k = 0; k < site_pin_count; k++)
+                if (strcasecmp(site_pins[k].domain, domain) == 0) {
+                    snprintf(cur, sizeof(cur), "%.*s", 63, site_pins[k].ip);
+                    break;
+                }
+            // Домен не закреплён — подбираем, но не каждый круг, иначе модуль
+            // без правил перезапустит подбор с нуля на каждом проходе.
+            if (!cur[0]) continue;
+            if (site_probe_tcp(cur, 443, PROBE_TIMEOUT_MS) &&
+                site_probe_cert_ok(cur, domain, PROBE_TIMEOUT_MS) != 0)
+                continue;   // адрес жив, ничего не делаем
+
+            char cands[8][64];
+            int nc = 0;
+            doh_resolve_a_multi(domain, cands, 8, &nc);
+            for (int c = 0; c < nc; c++) {
+                if (strcmp(cands[c], cur) == 0) continue;
+                if (!site_probe_tcp(cands[c], 443, PROBE_TIMEOUT_MS)) continue;
+                if (site_probe_cert_ok(cands[c], domain, PROBE_TIMEOUT_MS) == 0) continue;
+                char line[340];
+                snprintf(line, sizeof(line), "%.*s %.*s\n", 200, domain, 63, cands[c]);
+                pin_file_replace(state->pin_path, line);
+                printf("[%s]   фон: %s переехал с %s на %s (старый не отвечает)\n",
+                       ctx->module, domain, cur, cands[c]);
+                break;
+            }
+        }
+        for (int s = 0; s < REFRESH_INTERVAL && state->active && !state->stopping; s++)
+            sleep(1);
+    }
+    return NULL;
+}
+
 // Стабильные закрепления.
 //
 // CDN отдают новый адрес на каждый запрос, поэтому после каждого перезапуска
@@ -481,6 +635,36 @@ static int prev_pin_count;
 
 static void pins_path(char *out, size_t cap, const char *name) {
     snprintf(out, cap, "/run/rmf/pins/%s.pin", name);
+}
+
+// Перечитывание файла закреплений прямо в рабочий набор.
+//
+// Ответчик работает в форкнутом процессе и держит свою копию site_pins с
+// момента запуска. Фоновая перепроверка в родителе дописывает в файл удачные
+// адреса, поэтому без перечитывания они доезжали бы только после перезапуска
+// модуля — а весь смысл фоновой работы в том, чтобы не перезапускать.
+//
+// Файл читается целиком и применяется только если он не пуст: иначе временно
+// обрезанный при записи файл оставил бы ответчик вовсе без закреплений.
+static void pins_reload(const char *path, size_t cap) {
+    (void)cap;
+    if (!path || !path[0]) return;
+    site_pin_t fresh[MAX_SITE_DOMAINS];
+    int n = 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[400];
+    while (n < MAX_SITE_DOMAINS && fgets(line, sizeof(line), f)) {
+        char dom[256], ip[64];
+        if (sscanf(line, "%255s %63s", dom, ip) != 2) continue;
+        snprintf(fresh[n].domain, sizeof(fresh[n].domain), "%s", dom);
+        snprintf(fresh[n].ip, sizeof(fresh[n].ip), "%s", ip);
+        n++;
+    }
+    fclose(f);
+    if (n == 0) return;              // пустой или обрезанный файл — не применяем
+    memcpy(site_pins, fresh, sizeof(fresh[0]) * (size_t)n);
+    site_pin_count = n;
 }
 
 static int pins_load(const char *name) {
@@ -554,6 +738,11 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
     // остальные site-модули мерили сами себя.
     site_probe_set_mark((unsigned int)state->mark);
     state->dns_fd = -1;
+    if (config->name && config->name[0]) {
+        pins_path(state->pin_path, sizeof(state->pin_path), config->name);
+        struct stat pst;
+        state->pin_mtime = (stat(state->pin_path, &pst) == 0) ? pst.st_mtime : 0;
+    }
     pins_load(config->name);
     site_pin_count = 0;
     site_ip_validator = config->validate_ip;
@@ -742,6 +931,7 @@ pin_ready:
     if (!use_relay) {
         state->relay_on = false;
         state->active = true;
+        start_pin_refresh(state, config);
         return 0;
     }
     // Рель остаётся plain_relay.
@@ -766,11 +956,20 @@ pin_ready:
     }
     state->relay_on = true;
     state->active = true;
+    start_pin_refresh(state, config);
     return 0;
 }
 
 void site_bypass_stop(site_bypass_state_t *state) {
     if (!state) return;
+    // Поток останавливаем первым: он пишет файл закреплений, а ответчик и
+    // рель сейчас будут сняты. Если он успеет дописать после этого, следующий
+    // запуск стартует с адреса, которого никто не проверял.
+    state->stopping = true;
+    if (g_refresh_running) {
+        pthread_join(g_refresh_th, NULL);
+        g_refresh_running = false;
+    }
     if (state->rules_installed || state->chain[0]) rules_remove(state);
     dns_stop(state);
     plain_relay_stop();
