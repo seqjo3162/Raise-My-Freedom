@@ -736,6 +736,11 @@ void discord_module_cleanup(void) {
 // Столько адресов перебираем при замере. Больше — медленно: на каждый уходит
 // своё окно, а весь inject выполняется синхронно и держит веб.
 #define DISCORD_MEASURE_ADDRS     4
+// Окно на ОДИН адрес при переборе. Короткое намеренно: файл, который идёт,
+// приходит за ~1,6 с, а обрезанный поток всё равно не пойдёт дальше — ждать
+// тут нечего. Пять секунд хватает, чтобы их различить, и не держат inject
+// (а он выполняется синхронно и блокирует веб) на две минуты.
+#define DISCORD_MEASURE_ONE_SEC   5
 // Эталонный ассет Discord: 782354 байта по Content-Length. Взят из разбора
 // страницы; при обрыве приходит 20-205 КБ, при полной доставке — все 782354.
 #define DISCORD_MEASURE_FULL     782354
@@ -748,6 +753,11 @@ void discord_module_cleanup(void) {
 // Запуск реля в заданном режиме разрыва SNI. Один помощник на оба
 // варианта: иначе конфиг реля пришлось бы дублировать, и при правке
 // одного места второе молча разошлось бы (так уже было с split_data).
+// Адрес, который замер признал отдающим файл целиком. Кладётся в конфиг реля
+// ДО его форка — иначе рель о предпочтении не узнает: после fork страница
+// общей памяти уже не разделена с процессом плагина.
+static char g_prefer_ip[64];
+
 static int start_relay(int use_split) {
     sni_relay_config_t rc = {
         .port = ctx.relay_port,
@@ -768,6 +778,7 @@ static int start_relay(int use_split) {
         .data_pause_ms = opt_relay_pause_ms,
         .no_split_handshake_records = opt_no_split_hs,
         .multi_parts = opt_multi_parts,
+        .preferred_ip = g_prefer_ip[0] ? g_prefer_ip : NULL,
     };
     if (sni_relay_start(&rc) != 0) return -1;
     ctx.relay_pid = sni_relay_pid();
@@ -793,7 +804,7 @@ static char g_measure_why[192];
 //
 // Тот же приём уже применён в src/dns/doh_resolve.c (fork+curl), так что это
 // не новый способ, а уже принятый в проекте.
-static long measure_path(const char *ip);
+static long measure_path(const char *ip, int sec);
 
 // Замер по НЕСКОЛЬКИМ адресам с выбором лучшего.
 //
@@ -809,7 +820,7 @@ static long measure_best(const char ips[][64], int n, char *best_ip, size_t cap)
     long best = -1;
     const int tries = n < DISCORD_MEASURE_ADDRS ? n : DISCORD_MEASURE_ADDRS;
     for (int i = 0; i < tries; i++) {
-        long got = measure_path(ips[i]);
+        long got = measure_path(ips[i], DISCORD_MEASURE_ONE_SEC);
         printf("[DISCORD]   замер %s -> %ld Б\n", ips[i], got);
         if (got > best) {
             best = got;
@@ -823,7 +834,7 @@ static long measure_best(const char ips[][64], int n, char *best_ip, size_t cap)
     return best;
 }
 
-static long measure_path(const char *ip) {
+static long measure_path(const char *ip, int sec) {
     g_measure_why[0] = '\0';
 
     struct sigaction ignore, saved;
@@ -844,7 +855,7 @@ static long measure_path(const char *ip) {
     char cmd[1200];
     snprintf(cmd, sizeof cmd,
              "curl -s -m %d -o '%s' --resolve 'discord.com:443:%s' '%s' 2>/dev/null",
-             DISCORD_MEASURE_SEC, tmp, ip, DISCORD_MEASURE_URL);
+             sec, tmp, ip, DISCORD_MEASURE_URL);
 
     long got = -1;
     struct stat st;
@@ -857,7 +868,7 @@ static long measure_path(const char *ip) {
     if (got <= 0) {
         got = -1;
         snprintf(g_measure_why, sizeof g_measure_why,
-                 "ни одного байта за %d с — путь закрыт", DISCORD_MEASURE_SEC);
+                 "ни одного байта за %d с — путь закрыт", sec);
     } else if (got < DISCORD_MEASURE_FLOOR) {
         snprintf(g_measure_why, sizeof g_measure_why,
                  "поток оборвался на %ld Б (полный файл %d Б)", got, DISCORD_MEASURE_FULL);
@@ -907,6 +918,55 @@ static void dc_wait_wake(void) {
     pthread_mutex_unlock(&dc_wait_mu);
 }
 
+
+// Снять правила конкретного адреса.
+//
+// iptables_del_rules() чистит цепочку целиком, а тут нужен точечный снос:
+// адрес мог отвалиться, но модуль продолжает работать и готовить новые адреса.
+static void iptables_del_ip(const char *ip) {
+    if (!is_root() || !ip) return;
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "iptables -t nat -D DISCORD_BYPASS -p tcp -d %.63s --dport 443 "
+             "-j REDIRECT --to-ports %d 2>/dev/null; "
+             "iptables -D DISCORD_QUIC -p udp --dport 443 -d %.63s -j REJECT "
+             "--reject-with icmp-port-unreachable 2>/dev/null; true",
+             ip, ctx.relay_port, ip);
+    sh(cmd);
+}
+
+// Убрать адрес из набора и снять его правила.
+//
+// Раньше набор только рос: мёртвый адрес оставался в нём и в правилах навсегда.
+// Набор переживает перезапуск, поэтому мусор копился между запусками, хотя
+// каждый проход заново резолвит домены и получает актуальные адреса.
+static int dc_set_remove(const char *ip) {
+    int idx = -1;
+    for (int i = 0; i < dc_set_n; i++)
+        if (strcmp(dc_set[i], ip) == 0) { idx = i; break; }
+    if (idx < 0) return 0;
+    memmove(&dc_set[idx][0], &dc_set[idx + 1][0],
+            (size_t)(dc_set_n - idx - 1) * sizeof dc_set[0]);
+    dc_set_n--;
+    iptables_del_ip(ip);
+    char path[512], tmp[560];
+    dc_set_path(path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (f) {
+        for (int i = 0; i < dc_set_n; i++) fprintf(f, "%s\n", dc_set[i]);
+        fclose(f);
+        rename(tmp, path);
+    }
+    return 1;
+}
+
+// Ответ ли адрес. Проба помеченная: иначе она измеряет собственный рель,
+// а не провайдера — и мёртвым адрес будет считаться всегда.
+static int dc_addr_alive(const char *ip) {
+    return site_probe_tcp(ip, 443, 2500) ? 1 : 0;
+}
+
 static void *dc_refresh_thread(void *arg) {
     (void)arg;
     int round = 0;
@@ -917,6 +977,23 @@ static void *dc_refresh_thread(void *arg) {
             dc_wait(1);
         if (dc_refresh_stop || !ctx.mode) break;
         round++;
+
+        // Сначала вычищаем мёртвые адреса, и только потом дополняем набор
+        // свежими. Обратный порядок опасен: если резолв вернёт пусто, а
+        // вычистка уже идёт, можно остаться вообще без адресов, и клиент
+        // получит мгновенный RST. Поэтому вычищаем не больше половины
+        // набора, а свежие ответы сразу возвращаем в оборот.
+        int alive = 0, dead = 0;
+        char deadlist[DC_SET_MAX][64];
+        for (int i = 0; i < dc_set_n; i++) {
+            if (dc_refresh_stop || !ctx.mode) return NULL;
+            if (dc_addr_alive(dc_set[i])) { alive++; continue; }
+            snprintf(deadlist[dead], sizeof deadlist[0], "%.63s", dc_set[i]);
+            dead++;
+        }
+        int budget = dc_set_n / 2;
+        if (dead > budget) dead = budget;
+        for (int i = 0; i < dead; i++) dc_set_remove(deadlist[i]);
 
         char ips[32][64];
         int n = collect_own_ips(ips, 32);
@@ -936,9 +1013,9 @@ static void *dc_refresh_thread(void *arg) {
             iptables_add_redirect(ips[i]);
             if (dc_refresh_split) iptables_quic_reject(ips[i]);
         }
-        if (added)
-            printf("[DISCORD] перепроверка %d: +%d адрес, в наборе %d\n",
-                   round, added, dc_set_n);
+        if (added || dead)
+            printf("[DISCORD] перепроверка %d: +%d, выбыло %d (живых %d), в наборе %d\n",
+                   round, added, dead, alive, dc_set_n);
     }
     return NULL;
 }
@@ -1110,8 +1187,21 @@ void discord_module_inject(int fd) {
             // отбрасывает. Победитель из замера как раз обходит эту дыру.
             const char *winner = use_split ? best_a : best_b;
             if (winner && winner[0]) {
-                sni_relay_prefer(winner);
-                printf("[DISCORD]   рель настроен на адрес с полным потоком: %s\n", winner);
+                // Победителя надо зафиксировать в конфиге и перезапустить рель:
+                // страница общей памяти создаётся при старте и наследуется
+                // через fork, поэтому «подсказать» уже работающему релю нельзя.
+                // Рестарт дёшев — форк и listen, — и он того стоит.
+                if (strcmp(g_prefer_ip, winner) != 0) {
+                    snprintf(g_prefer_ip, sizeof g_prefer_ip, "%s", winner);
+                    sni_relay_stop();
+                    usleep(300000);
+                    if (start_relay(use_split) != 0)
+                        fprintf(stderr, "[DISCORD] не удалось перезапустить рель "
+                                        "с предпочтительным адресом %s\n", winner);
+                    else
+                        printf("[DISCORD]   рель настроен на адрес с полным потоком: %s\n",
+                               winner);
+                }
             }
         } else {
             printf("[DISCORD]   разрыв SNI: %s (auto_split=0, как в конфиге)\n",

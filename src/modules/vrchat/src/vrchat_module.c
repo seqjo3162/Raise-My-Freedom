@@ -1,5 +1,6 @@
 #include "src/modules/vrchat/include/header.h"
 #include "src/dns/doh_resolve.h"
+#include <pthread.h>
 #include "src/modules/vrchat/src/vrchat_discovery.h"
 #include "src/common/site_probe.h"
 #include "src/common/plain_relay.h"
@@ -467,6 +468,15 @@ static void pins_verify_self(void) {
     for (int i = 0; i < vc_cache_n; i++) {
         char dom[256];
         snprintf(dom, sizeof(dom), "%s", vc_dom[i]);
+          // Сессионные хосты — исключение, и здесь оно обязательно.
+          //
+          // Выше по этой же функции стоит прямой запрет трогать их: ими
+          // управляет только разведка, иначе адреса разъезжаются и VRChat
+          // рвёт сессию. Чистка кэша этот запрет не повторяла и удаляла их
+          // записи. Проверено: блокировка одного адреса выбивала из кеша сразу
+          // четыре записи — api, pipeline, vrchat.com и www.vrchat.com, — и до
+          // следующего прохода разведки (900 с) они остались без закрепления.
+          if (is_session_host(dom)) continue;
         if (site_probe_tcp(vc_ip[i], 443, 2000) == 1) continue;
         printf("[VRCHAT]   запись кеша не отвечает, удаляю: %s %s\n", dom, vc_ip[i]);
         vc_cache_del(dom);
@@ -476,6 +486,53 @@ static void pins_verify_self(void) {
 
 // Проверка идёт в отдельном процессе и не тормозит запуск модуля: DoH-запрос
 // на каждый пин — это fork и curl, и на старте это заметная пауза.
+
+// Периодическая сверка закреплений.
+//
+// Сама сверка (pins_verify_self) умеет всё нужное: помеченной пробой отсеивает
+// мёртвые адреса, находит замену через DoH и пишет её в файл, а ответчик
+// подхватывает файл по mtime. Проблема была не в логике, а в том, что её
+// звали один раз при старте — после смены сети модуль держал протухший адрес
+// до перезапуска.
+//
+// Нить ничего не считает сама: она только будит сверку, а сверка работает в
+// форкнутом процессе. Так сохраняется исходная идея — не делить кэш с
+// процессом ответчика.
+#define PINS_RECHECK_SEC 300
+
+// Опережающее объявление: сверка описана ниже, а нить будит её раньше.
+static void pins_verify_async(void);
+
+static volatile int g_recheck_stop;
+static volatile int g_recheck_running;
+static pthread_t g_recheck_th;
+
+static void *pins_recheck_thread(void *arg) {
+    (void)arg;
+    for (int t = 0; t < PINS_RECHECK_SEC && !g_recheck_stop; t++) sleep(1);
+    while (!g_recheck_stop) {
+        pins_verify_async();
+        for (int t = 0; t < PINS_RECHECK_SEC && !g_recheck_stop; t++) sleep(1);
+    }
+    return NULL;
+}
+
+static void pins_recheck_start(void) {
+    if (g_recheck_running) return;
+    g_recheck_stop = 0;
+    if (pthread_create(&g_recheck_th, NULL, pins_recheck_thread, NULL) == 0)
+        g_recheck_running = 1;
+}
+
+static void pins_recheck_stop(void) {
+    if (!g_recheck_running) return;
+    g_recheck_stop = 1;
+    // join обязателен: поток исполняет код этой библиотеки, и после dlclose
+    // любое его пробуждение — падение.
+    pthread_join(g_recheck_th, NULL);
+    g_recheck_running = 0;
+}
+
 static void pins_verify_async(void) {
     pid_t p = fork();
     if (p != 0) { if (p < 0) fprintf(stderr, "[VRCHAT] fork для проверки пинов не удался\n"); return; }
@@ -1008,6 +1065,7 @@ void vrchat_module_inject(int fd) {
     // Сверка пинов асинхронная: модуль поднимается сразу, протухшие адреса
     // выбрасываются в фоне помеченной пробой.
     pins_verify_async();
+    pins_recheck_start();
 
     // Фоновая разведка: сама подтягивает свежие адреса, проверяет их
     // соединением и раскладывает по правилам. Старую проверку пин��в
@@ -1098,6 +1156,7 @@ void vrchat_module_remove(void) {
     // просыпается после dlclose и исполняет код размапленного .so — это
     // падение. Раньше vrchat_discovery_stop() не вызывался вообще.
     vrchat_discovery_stop();
+    pins_recheck_stop();
     iptables_del_rules();
     responder_stop();
     plain_relay_stop();

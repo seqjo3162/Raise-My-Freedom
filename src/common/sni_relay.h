@@ -16,7 +16,12 @@ typedef struct {
     int (*validate_ip)(const char *ip);
     const char *const *fallback_ips;
     size_t fallback_count;
-    int split_data_records;     // 1 = дробить и записи с данными (0x17), не только handshake
+    // Адрес, заведомо отдающий файл целиком. Задаётся ДО старта: страница общей
+  // памяти создаётся в sni_relay_start, а рель наследует её через fork, поэтому
+  // передать адрес после старта уже нельзя — процесс плагина и процесс реля
+  // создали бы разные отображения. NULL = «не задано, первый успешный».
+  const char *preferred_ip;
+  int split_data_records;     // 1 = дробить и записи с данными (0x17), не только handshake
     int split_record_size;      // размер одной части data-записи в байтах
     int split_record_delay_ms;  // пауза между частями
     // Внимание: поля ниже инвертированы или имеют 0 = «прежнее поведение».
