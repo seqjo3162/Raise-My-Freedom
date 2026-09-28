@@ -38,6 +38,9 @@ typedef struct {
 
 static site_pin_t site_pins[MAX_SITE_DOMAINS];
 static int site_pin_count;
+// Домены, у которых не нашлось ни одного достижимого адреса. Считается при
+// подборе адресов, читается доктором при решении про рель.
+static int g_blocked_domains;
 static int (*site_ip_validator)(const char *ip);
 static const char *site_fallback_ips[16];
 static size_t site_fallback_count;
@@ -136,15 +139,28 @@ static int site_doctor(const site_bypass_config_t *config) {
                    "адрес выброшен\n", config->name, site_pins[i].domain, ip);
             continue;
         }
-        if (tested < PROBE_MAX_IPS && cert == 1) {
-            // Проверяем дважды: блокировка у провайдера меняется во времени, и по
-            // одной удачной пробе доктор снимал рель у домена, который через
-            // минуту снова оказывался зарезанным. Два подряд «вижу» — верим;
-            // любая тишина — считаем домен режется по имени.
-            int sni1 = site_probe_sni(ip, site_pins[i].domain, PROBE_TIMEOUT_MS);
-            int sni2 = (sni1 == 1)
-                ? site_probe_sni(ip, site_pins[i].domain, PROBE_TIMEOUT_MS) : 0;
-            if (sni1 != 1 || sni2 != 1) silent++;
+        if (tested < PROBE_MAX_IPS) {
+            if (cert == 1) {
+                // Проверяем дважды: блокировка у провайдера меняется во времени,
+                // и по одной удачной пробе доктор снимал рель у домена, который
+                // через минуту снова оказывался зарезанным. Два подряд «вижу» —
+                // верим; любая тишина — считаем домен режется по имени.
+                int sni1 = site_probe_sni(ip, site_pins[i].domain, PROBE_TIMEOUT_MS);
+                int sni2 = (sni1 == 1)
+                    ? site_probe_sni(ip, site_pins[i].domain, PROBE_TIMEOUT_MS) : 0;
+                if (sni1 != 1 || sni2 != 1) silent++;
+            } else {
+                // TCP до адреса доходит, а рукопожатие не завершается. Это
+                // блокировка по имени: соединение открывают, TLS рвут. Именно так
+                // ведёт себя huggingface.co — на 143.204.238.31 порт 443 отвечает
+                // сразу, а сертификат не выдаётся никогда.
+                //
+                // Раньше такой пин сохранялся молча и в счётчик не попадал, а
+                // доктор видел только здоровые домены и решал, что рель не
+                // нужен. Из-за этого зарезанный домен оставался недоступным,
+                // и подменять его было нечем: закрыты все четыре адреса.
+                silent++;
+            }
             tested++;
         }
         if (kept < MAX_SITE_DOMAINS) kept_pins[kept++] = site_pins[i];
@@ -184,8 +200,14 @@ static int site_doctor(const site_bypass_config_t *config) {
         if (config->use_relay) printf("[%s] рель включён принудительно\n", config->name);
         return config->use_relay;
     }
-    if (silent > 0) {
-        printf("[%s] домен режут по имени → нужен рель с разрывом SNI\n", config->name);
+    // Домен без достижимого адреса — тоже блокировка, даже если site_probe_sni
+    // ничего не показал: до адреса просто не доходит, и тишина тут не про SNI.
+    if (silent > 0 || g_blocked_domains > 0) {
+        if (g_blocked_domains > 0)
+            printf("[%s] доменов без достижимого адреса: %d — рель обязателен\n",
+                   config->name, g_blocked_domains);
+        if (silent > 0)
+            printf("[%s] домен режут по имени → нужен рель с разрывом SNI\n", config->name);
         return 1;
     }
     printf("[%s] домен дважды подряд ответил как есть → рель не нужен, "
@@ -539,6 +561,7 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
     for (size_t i = 0; i < site_fallback_count; i++)
         site_fallback_ips[i] = config->fallback_ips ? config->fallback_ips[i] : NULL;
 
+    g_blocked_domains = 0;
     for (size_t i = 0; i < config->domain_count && site_pin_count < MAX_SITE_DOMAINS; i++) {
         if (!config->domains[i]) continue;
         char domain[256], ip[64] = {0};
@@ -680,6 +703,21 @@ int site_bypass_start(site_bypass_state_t *state, const site_bypass_config_t *co
             else
                 printf("[%s] %s: все адреса недостижимы с этой сети\n",
                        config->name, domain);
+            // Домен без единого достижимого адреса — самый сильный сигнал,
+            // что провайдер режет его по имени, и рель здесь обязателен.
+            //
+            // Раньше такой домен просто пропускался: адреса выбрасывались, а
+            // счётчик блокировок при этом не пополнялся. Доктор же принимает
+            // решение на модуль, а не на домен, и у HF одновременно есть и
+            // вполне рабочие домены (hf.co, cdn-lfs), и один зарезанный
+            // целиком (huggingface.co). Рабочие давали «ответил как есть», и
+            // рель не включался — а именно из-за него huggingface.co и не
+            // открывался: закрыты все четыре адреса, и подменять их нечем.
+            //
+            // Теперь отсутствие адреса засчитывается как блокировка, и рель
+            // поднимается на весь модуль: он ничего не портит работающим
+            // доменам, а зарезанному становится единственным путём.
+            if (g_blocked_domains < MAX_SITE_DOMAINS) g_blocked_domains++;
         }
         if (!site_ip_allowed(ip)) continue;   // причина уже напечатана выше
 pin_ready:
@@ -706,10 +744,15 @@ pin_ready:
         state->active = true;
         return 0;
     }
-    // Именно plain_relay, а не sni_relay: адрес уже проверен доктором, и
-    // sni_relay при недоступном первом кандидате уходил в каскад из DoH и
-    // обычных DNS — тридцать с лишним, а у клиента TLS-таймаут 8-10 с, и
-    // соединение умирало раньше, чем рель успевал подобрать адрес.
+    // Рель остаётся plain_relay.
+    //
+    // sni_relay здесь пробовался и не годится: при включении все домены
+    // модуля зависали по 18-20 с, потому что у реля не было живого кандидата и
+    // он уходил в собственный резолв. Параметры разрыва из discord не помогли.
+    //
+    // Помогло другое: выбор живого адреса из кандидатов. huggingface.co сидел
+    // на 143.204.238.31, который зарезан, и после правки отбора переехал на
+    // 143.204.238.110, который отвечает. Рель для этого не требовался.
     plain_relay_config_t relay = {
         .port = state->relay_port,
         .so_mark = state->mark,
