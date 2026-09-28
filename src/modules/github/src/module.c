@@ -3,6 +3,10 @@
 
 static const char *const site_domains[] = {
     "github.com",
+    // Без этого ш��ла по суффиксу от github.com, и ssh.github.com уезжал на
+    // адрес обычного сайта: 4.225.11.194 вместо 4.225.11.200. Соединение
+    // закрывалось на handshake, и git push по ssh не проходил.
+    "ssh.github.com",
     "gist.github.com",
     "codeload.github.com",
     "api.github.com",
